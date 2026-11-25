@@ -392,6 +392,14 @@ class Compiler {
   // mode; 3) the size of the output data in bytes. When the output is SPIR-V
   // binary code, the size is the number of bytes of valid data in the vector.
   // If the output is a text string, the size equals the length of that string.
+  //
+  // If entry_point_found is not null, it is set to whether the parsed shader
+  // defines the entry point that was asked for.  Glslang treats a missing
+  // HLSL entry point as a warning and still generates a module with an empty
+  // entry point, so callers that need to tell "compiled the requested entry
+  // point" apart from "compiled a stub" must check this flag.  It is left
+  // unchanged for outputs that never parse the shader, such as preprocessed
+  // text.
   std::tuple<bool, std::vector<uint32_t>, size_t> Compile(
       const string_piece& input_source_string, EShLanguage forced_shader_stage,
       const std::string& error_tag, const char* entry_point_name,
@@ -399,8 +407,8 @@ class Compiler {
                                       const string_piece& error_tag)>&
           stage_callback,
       CountingIncluder& includer, OutputType output_type,
-      std::ostream* error_stream, size_t* total_warnings,
-      size_t* total_errors) const;
+      std::ostream* error_stream, size_t* total_warnings, size_t* total_errors,
+      bool* entry_point_found = nullptr) const;
 
   static EShMessages GetDefaultRules() {
     return static_cast<EShMessages>(EShMsgSpvRules | EShMsgVulkanRules |

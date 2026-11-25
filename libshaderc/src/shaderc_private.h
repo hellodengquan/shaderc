@@ -96,6 +96,23 @@ struct shaderc_compiler {
   std::unique_ptr<shaderc_util::GlslangInitializer> initializer;
 };
 
+// Described in shaderc.h.
+//
+// Owns one compilation result per requested entry point, in request order, and
+// the request metadata needed to identify a failing entry point.
+struct shaderc_compilation_result_set {
+  struct Entry {
+    // The name and stage that were requested for this entry point.
+    std::string entry_point_name;
+    shaderc_shader_kind stage = shaderc_glsl_infer_from_source;
+    // Owned result.  A null result means the entry point could not be
+    // compiled, e.g. because the request itself was malformed.
+    std::unique_ptr<shaderc_compilation_result> result;
+  };
+
+  std::vector<Entry> entries;
+};
+
 // Converts a shader stage from shaderc_shader_kind into a shaderc_util::Compiler::Stage.
 // This is only valid for a specifically named shader stage, e.g. vertex through fragment,
 // or compute.

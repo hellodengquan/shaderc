@@ -563,6 +563,104 @@ shaderc_compile_into_preprocessed_text(
     const char* input_file_name, const char* entry_point_name,
     const shaderc_compile_options_t additional_options);
 
+// Describes one entry point in a request to compile several entry points at
+// once.  Each entry point is compiled independently for its own shader stage,
+// as if it had been requested with its own call to shaderc_compile_into_spv.
+struct shaderc_entry_point {
+  // Null-terminated name of the entry point.  For HLSL this selects the
+  // function to use as the entry point.  For GLSL the name is ignored and the
+  // entry point is always "main", matching shaderc_compile_into_spv.
+  const char* name;
+  // The shader stage of this entry point.  It must name a concrete stage,
+  // such as shaderc_vertex_shader or shaderc_fragment_shader.  Kinds that
+  // infer or default the stage are rejected for this entry point.
+  shaderc_shader_kind stage;
+};
+// Convenience alias so the type can be named without the 'struct' tag in both
+// C and C++.
+typedef struct shaderc_entry_point shaderc_entry_point;
+
+// An opaque handle to the results of a call to one of the
+// shaderc_compile_into_*_multiple_entry_points() functions.  It holds one
+// compilation result per requested entry point, in the same order as the
+// request.  It is null only when the set itself could not be allocated; a
+// malformed individual entry point request is reported as a failed result at
+// that entry point's index.
+typedef struct shaderc_compilation_result_set* shaderc_compilation_result_set_t;
+
+// Compiles the entry points described by entry_points from a single source
+// string, and returns a result set with one SPIR-V binary module per entry
+// point.  Each module is produced exactly as if the corresponding entry point
+// had been compiled alone with shaderc_compile_into_spv, so it carries the
+// execution model and the resource interface reachable from that entry point.
+//
+// The source_text, input_file_name and additional_options parameters have the
+// same meaning as in shaderc_compile_into_spv.  entry_points points to
+// num_entry_points descriptions; the strings they refer to only need to stay
+// alive for the duration of this call.  A stage that is not concrete makes only
+// that entry point fail.  For HLSL, an entry point name that the source does
+// not define also makes only that entry point fail; for GLSL the name is
+// ignored, as in shaderc_compile_into_spv.  The returned set keeps one result
+// per requested entry point, in request order, so a failing entry point can be
+// located by its index, name and stage without disturbing the others.
+//
+// May be safely called from multiple threads without explicit synchronization.
+// If there was a failure allocating the result set, null is returned.
+SHADERC_EXPORT shaderc_compilation_result_set_t
+shaderc_compile_into_spv_multiple_entry_points(
+    const shaderc_compiler_t compiler, const char* source_text,
+    size_t source_text_size, const char* input_file_name,
+    const shaderc_entry_point* entry_points, size_t num_entry_points,
+    const shaderc_compile_options_t additional_options);
+
+// Like shaderc_compile_into_spv_multiple_entry_points, but each result in the
+// set contains SPIR-V assembly text instead of a SPIR-V binary module.
+SHADERC_EXPORT shaderc_compilation_result_set_t
+shaderc_compile_into_spv_assembly_multiple_entry_points(
+    const shaderc_compiler_t compiler, const char* source_text,
+    size_t source_text_size, const char* input_file_name,
+    const shaderc_entry_point* entry_points, size_t num_entry_points,
+    const shaderc_compile_options_t additional_options);
+
+// The functions below operate on shaderc_compilation_result_set_t objects.
+// They offer only the basic thread-safety guarantee.
+
+// Releases the result set and every compilation result in it.  It is invalid
+// to use any of the results borrowed from the set afterwards.  It is safe to
+// pass null to this function, and doing so has no effect.
+SHADERC_EXPORT void shaderc_result_set_release(
+    shaderc_compilation_result_set_t result_set);
+
+// Returns the number of results in the set, which is the number of entry
+// points requested.  Returns 0 if result_set is null.
+SHADERC_EXPORT size_t shaderc_result_set_get_num_results(
+    const shaderc_compilation_result_set_t result_set);
+
+// Returns the compilation result for the entry point at index, or null if
+// index is out of range.  The result is owned by the set and must not be
+// released separately; it remains valid until the set is released.
+SHADERC_EXPORT shaderc_compilation_result_t shaderc_result_set_get_result(
+    const shaderc_compilation_result_set_t result_set, size_t index);
+
+// Returns the null-terminated entry point name that was requested at index, or
+// null if index is out of range.  The string remains valid until the set is
+// released.
+SHADERC_EXPORT const char* shaderc_result_set_get_entry_point_name(
+    const shaderc_compilation_result_set_t result_set, size_t index);
+
+// Returns the shader stage that was requested for the entry point at index, or
+// shaderc_glsl_infer_from_source if index is out of range.
+SHADERC_EXPORT shaderc_shader_kind shaderc_result_set_get_entry_point_stage(
+    const shaderc_compilation_result_set_t result_set, size_t index);
+
+// Returns the status of the whole request: shaderc_compilation_status_success
+// when every entry point compiled successfully, otherwise the status of the
+// first entry point that failed.  A set with zero results is a success.
+// Returns shaderc_compilation_status_null_result_object if result_set is null.
+SHADERC_EXPORT shaderc_compilation_status
+shaderc_result_set_get_compilation_status(
+    const shaderc_compilation_result_set_t result_set);
+
 // Takes an assembly string of the format defined in the SPIRV-Tools project
 // (https://github.com/KhronosGroup/SPIRV-Tools/blob/master/syntax.md),
 // assembles it into SPIR-V binary and a shaderc_compilation_result will be

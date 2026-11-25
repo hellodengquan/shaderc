@@ -17,6 +17,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <memory>
 #include <thread>
 #include <unordered_map>
@@ -1644,6 +1645,353 @@ TEST(EntryPointTest, LangHlslOnHlslVertexSucceedsWithGivenEntryPointName) {
       << std::string(shaderc_result_get_bytes(compilation.result()));
 }
 #endif
+
+// One HLSL source holding two entry points for one effect.  Each entry point
+// reaches a different resource, so the modules produced for them must differ
+// in their descriptor binding and in their execution model.
+const char kHlslTwoEntryPointShader[] =
+    "Texture2D<float4> DiffuseTex : register(t1);\n"
+    "SamplerState LinearSampler : register(s2);\n"
+    "RWStructuredBuffer<float4> Positions : register(u3);\n"
+    "float4 VSMain(uint id : SV_VertexID) : SV_POSITION {\n"
+    "  return Positions[id];\n"
+    "}\n"
+    "float4 PSMain(float4 pos : SV_POSITION) : SV_Target {\n"
+    "  return DiffuseTex.Sample(LinearSampler, pos.xy);\n"
+    "}\n";
+
+// A minimal HLSL vertex shader used where only one entry point is needed.
+const char kHlslSingleEntryPointShader[] =
+    "float4 OnlyMain(uint id : SV_VertexID) : SV_POSITION {\n"
+    "  return float4(1.0, 2.0, 3.0, 4.0);\n"
+    "}\n";
+
+// RAII wrapper for shaderc_compilation_result_set_t.
+class CompilationSet {
+ public:
+  CompilationSet(shaderc_compilation_result_set_t result_set)
+      : result_set_(result_set) {}
+  ~CompilationSet() { shaderc_result_set_release(result_set_); }
+
+  shaderc_compilation_result_set_t get() const { return result_set_; }
+
+  // Returns the SPIR-V assembly text of the result at index, or an empty string
+  // when the result is missing or did not compile.
+  std::string AssemblyAt(size_t index) const {
+    shaderc_compilation_result_t result =
+        shaderc_result_set_get_result(result_set_, index);
+    if (!result || shaderc_result_get_compilation_status(result) !=
+                       shaderc_compilation_status_success)
+      return "";
+    return std::string(shaderc_result_get_bytes(result),
+                       shaderc_result_get_length(result));
+  }
+
+ private:
+  CompilationSet(const CompilationSet&) = delete;
+  CompilationSet& operator=(const CompilationSet&) = delete;
+
+  shaderc_compilation_result_set_t result_set_;
+};
+
+#if SHADERC_ENABLE_HLSL
+// Compiles the two entry points of kHlslTwoEntryPointShader in one request and
+// checks that each module carries its own entry point, execution model and
+// resource interface, matching what an independent compilation produces.
+TEST(EntryPointSetTest, MultipleEntryPointsGetIndependentModules) {
+  Compiler compiler;
+  Options options;
+  shaderc_compile_options_set_source_language(options.get(),
+                                              shaderc_source_language_hlsl);
+  const shaderc_entry_point entry_points[] = {
+      {"VSMain", shaderc_vertex_shader},
+      {"PSMain", shaderc_fragment_shader},
+  };
+  CompilationSet set(shaderc_compile_into_spv_assembly_multiple_entry_points(
+      compiler.get_compiler_handle(), kHlslTwoEntryPointShader,
+      strlen(kHlslTwoEntryPointShader), "shader", entry_points, 2,
+      options.get()));
+  ASSERT_NE(nullptr, set.get());
+  ASSERT_EQ(2u, shaderc_result_set_get_num_results(set.get()));
+  EXPECT_EQ(shaderc_compilation_status_success,
+            shaderc_result_set_get_compilation_status(set.get()));
+
+  const std::string vs_assembly = set.AssemblyAt(0);
+  const std::string ps_assembly = set.AssemblyAt(1);
+  ASSERT_FALSE(vs_assembly.empty());
+  ASSERT_FALSE(ps_assembly.empty());
+
+  // Each entry point is the module's own entry point, with its own execution
+  // model.
+  EXPECT_THAT(vs_assembly, HasSubstr("OpEntryPoint Vertex %VSMain \"VSMain\""));
+  EXPECT_THAT(vs_assembly, Not(HasSubstr("OpExecutionMode")));
+  EXPECT_THAT(ps_assembly,
+              HasSubstr("OpEntryPoint Fragment %PSMain \"PSMain\""));
+  EXPECT_THAT(ps_assembly,
+              HasSubstr("OpExecutionMode %PSMain OriginUpperLeft"));
+
+  // The vertex module exposes only the vertex entry point's resource, and the
+  // fragment module exposes only the fragment entry point's resources.  Neither
+  // module inherited the other's interface.
+  EXPECT_THAT(vs_assembly, HasSubstr("OpDecorate %Positions_0 Binding 3"));
+  EXPECT_THAT(vs_assembly, Not(HasSubstr("DiffuseTex")));
+  EXPECT_THAT(vs_assembly, Not(HasSubstr("LinearSampler")));
+  EXPECT_THAT(ps_assembly, HasSubstr("OpDecorate %DiffuseTex Binding 1"));
+  EXPECT_THAT(ps_assembly, HasSubstr("OpDecorate %LinearSampler Binding 2"));
+  EXPECT_THAT(ps_assembly, Not(HasSubstr("Positions")));
+}
+
+// Compiles each entry point on its own and confirms that the batch compilations
+// produce exactly the same SPIR-V assembly as the separate compilations.
+TEST(EntryPointSetTest, ModulesMatchIndividualCompilations) {
+  Compiler compiler;
+  Options options;
+  shaderc_compile_options_set_source_language(options.get(),
+                                              shaderc_source_language_hlsl);
+  const struct {
+    const char* name;
+    shaderc_shader_kind stage;
+  } requests[] = {
+      {"VSMain", shaderc_vertex_shader},
+      {"PSMain", shaderc_fragment_shader},
+  };
+  shaderc_entry_point entry_points[2];
+  for (int i = 0; i < 2; ++i) {
+    entry_points[i].name = requests[i].name;
+    entry_points[i].stage = requests[i].stage;
+  }
+
+  CompilationSet set(shaderc_compile_into_spv_assembly_multiple_entry_points(
+      compiler.get_compiler_handle(), kHlslTwoEntryPointShader,
+      strlen(kHlslTwoEntryPointShader), "shader", entry_points, 2,
+      options.get()));
+  ASSERT_NE(nullptr, set.get());
+
+  for (int i = 0; i < 2; ++i) {
+    const Compilation individual(compiler.get_compiler_handle(),
+                                 kHlslTwoEntryPointShader, requests[i].stage,
+                                 "shader", requests[i].name, options.get(),
+                                 OutputType::SpirvAssemblyText);
+    ASSERT_TRUE(CompilationResultIsSuccess(individual.result()));
+    EXPECT_EQ(std::string(shaderc_result_get_bytes(individual.result()),
+                          shaderc_result_get_length(individual.result())),
+              set.AssemblyAt(i))
+        << "entry point " << requests[i].name;
+  }
+}
+
+// A request mixing a valid, a missing, and a valid entry point must keep all
+// three results in request order.  The missing entry point fails on its own
+// and does not shift or suppress the modules of the other two.
+TEST(EntryPointSetTest, MissingEntryPointFailsWithoutDisturbingOthers) {
+  Compiler compiler;
+  Options options;
+  shaderc_compile_options_set_source_language(options.get(),
+                                              shaderc_source_language_hlsl);
+  const shaderc_entry_point entry_points[] = {
+      {"VSMain", shaderc_vertex_shader},
+      {"NoSuchMain", shaderc_fragment_shader},
+      {"PSMain", shaderc_fragment_shader},
+  };
+  CompilationSet set(shaderc_compile_into_spv_assembly_multiple_entry_points(
+      compiler.get_compiler_handle(), kHlslTwoEntryPointShader,
+      strlen(kHlslTwoEntryPointShader), "shader", entry_points, 3,
+      options.get()));
+  ASSERT_NE(nullptr, set.get());
+  ASSERT_EQ(3u, shaderc_result_set_get_num_results(set.get()));
+
+  // Results stay aligned with the request.
+  EXPECT_STREQ("VSMain", shaderc_result_set_get_entry_point_name(set.get(), 0));
+  EXPECT_STREQ("NoSuchMain",
+               shaderc_result_set_get_entry_point_name(set.get(), 1));
+  EXPECT_STREQ("PSMain", shaderc_result_set_get_entry_point_name(set.get(), 2));
+  EXPECT_EQ(shaderc_vertex_shader,
+            shaderc_result_set_get_entry_point_stage(set.get(), 0));
+  EXPECT_EQ(shaderc_fragment_shader,
+            shaderc_result_set_get_entry_point_stage(set.get(), 1));
+  EXPECT_EQ(shaderc_fragment_shader,
+            shaderc_result_set_get_entry_point_stage(set.get(), 2));
+
+  // The first and last entry points still compile.
+  shaderc_compilation_result_t first =
+      shaderc_result_set_get_result(set.get(), 0);
+  shaderc_compilation_result_t last =
+      shaderc_result_set_get_result(set.get(), 2);
+  ASSERT_NE(nullptr, first);
+  ASSERT_NE(nullptr, last);
+  EXPECT_EQ(shaderc_compilation_status_success,
+            shaderc_result_get_compilation_status(first));
+  EXPECT_EQ(shaderc_compilation_status_success,
+            shaderc_result_get_compilation_status(last));
+  EXPECT_THAT(set.AssemblyAt(0), HasSubstr("OpEntryPoint Vertex %VSMain"));
+  EXPECT_THAT(set.AssemblyAt(2), HasSubstr("OpEntryPoint Fragment %PSMain"));
+
+  // The middle entry point fails locally, with a diagnostic naming it, and
+  // carries no module.
+  shaderc_compilation_result_t missing =
+      shaderc_result_set_get_result(set.get(), 1);
+  ASSERT_NE(nullptr, missing);
+  EXPECT_EQ(shaderc_compilation_status_compilation_error,
+            shaderc_result_get_compilation_status(missing));
+  EXPECT_EQ(0u, shaderc_result_get_length(missing));
+  EXPECT_THAT(shaderc_result_get_error_message(missing),
+              HasSubstr("NoSuchMain"));
+
+  // The whole request reports a failure, and it is the failing entry point's.
+  EXPECT_EQ(shaderc_compilation_status_compilation_error,
+            shaderc_result_set_get_compilation_status(set.get()));
+}
+
+// A missing HLSL entry point must not be passed off as a compiled module of an
+// empty stub, unlike a bare shaderc_compile_into_spv call which only warns.
+TEST(EntryPointSetTest, MissingEntryPointDoesNotYieldStubModule) {
+  Compiler compiler;
+  Options options;
+  shaderc_compile_options_set_source_language(options.get(),
+                                              shaderc_source_language_hlsl);
+  const shaderc_entry_point entry_points[] = {
+      {"AbsentMain", shaderc_vertex_shader},
+  };
+  CompilationSet set(shaderc_compile_into_spv_multiple_entry_points(
+      compiler.get_compiler_handle(), kHlslSingleEntryPointShader,
+      strlen(kHlslSingleEntryPointShader), "shader", entry_points, 1,
+      options.get()));
+  ASSERT_NE(nullptr, set.get());
+  shaderc_compilation_result_t result =
+      shaderc_result_set_get_result(set.get(), 0);
+  ASSERT_NE(nullptr, result);
+  EXPECT_EQ(shaderc_compilation_status_compilation_error,
+            shaderc_result_get_compilation_status(result));
+  EXPECT_EQ(0u, shaderc_result_get_length(result));
+}
+
+// An entry point request that does not name a concrete stage fails that entry
+// point alone and reports the invalid stage, rather than guessing a stage.
+TEST(EntryPointSetTest, NonConcreteStageFailsThatEntryPointOnly) {
+  Compiler compiler;
+  Options options;
+  shaderc_compile_options_set_source_language(options.get(),
+                                              shaderc_source_language_hlsl);
+  const shaderc_entry_point entry_points[] = {
+      {"OnlyMain", shaderc_glsl_infer_from_source},
+      {"OnlyMain", shaderc_vertex_shader},
+  };
+  CompilationSet set(shaderc_compile_into_spv_assembly_multiple_entry_points(
+      compiler.get_compiler_handle(), kHlslSingleEntryPointShader,
+      strlen(kHlslSingleEntryPointShader), "shader", entry_points, 2,
+      options.get()));
+  ASSERT_NE(nullptr, set.get());
+  ASSERT_EQ(2u, shaderc_result_set_get_num_results(set.get()));
+
+  shaderc_compilation_result_t inferred =
+      shaderc_result_set_get_result(set.get(), 0);
+  ASSERT_NE(nullptr, inferred);
+  EXPECT_EQ(shaderc_compilation_status_invalid_stage,
+            shaderc_result_get_compilation_status(inferred));
+  EXPECT_THAT(shaderc_result_get_error_message(inferred),
+              HasSubstr("OnlyMain"));
+
+  shaderc_compilation_result_t explicit_stage =
+      shaderc_result_set_get_result(set.get(), 1);
+  ASSERT_NE(nullptr, explicit_stage);
+  EXPECT_EQ(shaderc_compilation_status_success,
+            shaderc_result_get_compilation_status(explicit_stage));
+  EXPECT_THAT(set.AssemblyAt(1),
+              HasSubstr("OpEntryPoint Vertex %OnlyMain \"OnlyMain\""));
+}
+#endif  // SHADERC_ENABLE_HLSL
+
+// A batch of one GLSL entry point must behave the same as a single
+// shaderc_compile_into_spv call, since GLSL always uses "main" and the name is
+// only a label in the request.
+TEST(EntryPointSetTest, GlslSingleEntryPointMatchesSingleCompilation) {
+  Compiler compiler;
+  const std::string shader =
+      "#version 450\n"
+      "layout(location = 0) in vec4 pos;\n"
+      "void main() { gl_Position = pos; }\n";
+  const shaderc_entry_point entry_points[] = {
+      {"main", shaderc_vertex_shader},
+  };
+  CompilationSet set(shaderc_compile_into_spv_multiple_entry_points(
+      compiler.get_compiler_handle(), shader.c_str(), shader.size(), "shader",
+      entry_points, 1, nullptr));
+  ASSERT_NE(nullptr, set.get());
+  ASSERT_EQ(1u, shaderc_result_set_get_num_results(set.get()));
+  shaderc_compilation_result_t result =
+      shaderc_result_set_get_result(set.get(), 0);
+  ASSERT_NE(nullptr, result);
+  ASSERT_EQ(shaderc_compilation_status_success,
+            shaderc_result_get_compilation_status(result));
+
+  const Compilation individual(compiler.get_compiler_handle(), shader,
+                               shaderc_vertex_shader, "shader", "main");
+  ASSERT_TRUE(CompilationResultIsSuccess(individual.result()));
+  EXPECT_EQ(std::string(shaderc_result_get_bytes(individual.result()),
+                        shaderc_result_get_length(individual.result())),
+            std::string(shaderc_result_get_bytes(result),
+                        shaderc_result_get_length(result)));
+}
+
+// A GLSL source can only define "main", so each entry point in a request is
+// distinguished only by its requested stage.  The same empty main is valid for
+// both stages; each result must still adopt its own requested execution model,
+// rather than reusing the first entry point's stage.
+TEST(EntryPointSetTest, GlslRequestUsesRequestedStagePerEntry) {
+  Compiler compiler;
+  const std::string shader =
+      "#version 450\n"
+      "void main() {}\n";
+  const shaderc_entry_point entry_points[] = {
+      {"main", shaderc_vertex_shader},
+      {"main", shaderc_fragment_shader},
+  };
+  CompilationSet set(shaderc_compile_into_spv_assembly_multiple_entry_points(
+      compiler.get_compiler_handle(), shader.c_str(), shader.size(), "shader",
+      entry_points, 2, nullptr));
+  ASSERT_NE(nullptr, set.get());
+  ASSERT_EQ(2u, shaderc_result_set_get_num_results(set.get()));
+
+  const std::string vs_assembly = set.AssemblyAt(0);
+  const std::string ps_assembly = set.AssemblyAt(1);
+  ASSERT_FALSE(vs_assembly.empty());
+  ASSERT_FALSE(ps_assembly.empty());
+  EXPECT_THAT(vs_assembly, HasSubstr("OpEntryPoint Vertex %main \"main\""));
+  EXPECT_THAT(vs_assembly, Not(HasSubstr("OriginUpperLeft")));
+  EXPECT_THAT(ps_assembly, HasSubstr("OpEntryPoint Fragment %main \"main\""));
+  EXPECT_THAT(ps_assembly, HasSubstr("OpExecutionMode %main OriginUpperLeft"));
+}
+
+// An empty request produces an empty, successful result set.
+TEST(EntryPointSetTest, EmptyRequestYieldsEmptySet) {
+  Compiler compiler;
+  CompilationSet set(shaderc_compile_into_spv_multiple_entry_points(
+      compiler.get_compiler_handle(), kMinimalShader, strlen(kMinimalShader),
+      "shader", nullptr, 0, nullptr));
+  ASSERT_NE(nullptr, set.get());
+  EXPECT_EQ(0u, shaderc_result_set_get_num_results(set.get()));
+  EXPECT_EQ(shaderc_compilation_status_success,
+            shaderc_result_set_get_compilation_status(set.get()));
+}
+
+// Indexing past the end of a result set is safe and yields no result.
+TEST(EntryPointSetTest, OutOfRangeAccessIsSafe) {
+  Compiler compiler;
+  const shaderc_entry_point entry_points[] = {
+      {"main", shaderc_vertex_shader},
+  };
+  CompilationSet set(shaderc_compile_into_spv_multiple_entry_points(
+      compiler.get_compiler_handle(), kMinimalShader, strlen(kMinimalShader),
+      "shader", entry_points, 1, nullptr));
+  ASSERT_NE(nullptr, set.get());
+  EXPECT_EQ(nullptr, shaderc_result_set_get_result(set.get(), 1));
+  EXPECT_EQ(nullptr, shaderc_result_set_get_entry_point_name(set.get(), 1));
+  EXPECT_EQ(shaderc_glsl_infer_from_source,
+            shaderc_result_set_get_entry_point_stage(set.get(), 1));
+  EXPECT_EQ(0u, shaderc_result_set_get_num_results(nullptr));
+  EXPECT_EQ(shaderc_compilation_status_null_result_object,
+            shaderc_result_set_get_compilation_status(nullptr));
+}
 
 // Returns a fragment shader accessing a texture with the given
 // offset.

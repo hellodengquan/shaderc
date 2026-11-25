@@ -17,6 +17,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "shaderc.h"
@@ -135,6 +136,160 @@ using SpvCompilationResult = CompilationResult<uint32_t>;
 using AssemblyCompilationResult = CompilationResult<char>;
 // Preprocessed source text.
 using PreprocessedSourceCompilationResult = CompilationResult<char>;
+
+// A non-owning view of one entry point's compilation from a
+// MultipleEntryPointsCompilationResult.
+//
+// It offers the same accessors as CompilationResult, and adds the entry point
+// name and shader stage that were requested, so a caller can report which entry
+// point a message or failure belongs to.  The view is valid only while the
+// result set it came from is alive.
+template <typename OutputElementType>
+class EntryPointCompilationResult {
+ public:
+  typedef OutputElementType element_type;
+  typedef const OutputElementType* const_iterator;
+
+  EntryPointCompilationResult(shaderc_compilation_result_t compilation_result,
+                              std::string entry_point_name,
+                              shaderc_shader_kind stage)
+      : compilation_result_(compilation_result),
+        entry_point_name_(std::move(entry_point_name)),
+        stage_(stage) {}
+
+  // Returns the requested entry point name.
+  const std::string& GetEntryPointName() const { return entry_point_name_; }
+
+  // Returns the requested shader stage.
+  shaderc_shader_kind GetEntryPointStage() const { return stage_; }
+
+  // Returns any error message found during compilation.
+  std::string GetErrorMessage() const {
+    if (!compilation_result_) return "";
+    return shaderc_result_get_error_message(compilation_result_);
+  }
+
+  // Returns the compilation status for this entry point.
+  shaderc_compilation_status GetCompilationStatus() const {
+    if (!compilation_result_)
+      return shaderc_compilation_status_null_result_object;
+    return shaderc_result_get_compilation_status(compilation_result_);
+  }
+
+  // Returns a random access (contiguous) iterator pointing to the start of the
+  // compilation output.  It is valid for the lifetime of the owning result set.
+  const_iterator cbegin() const {
+    if (!compilation_result_) return nullptr;
+    return reinterpret_cast<const_iterator>(
+        shaderc_result_get_bytes(compilation_result_));
+  }
+
+  // Returns the end iterator of the compilation output.
+  const_iterator cend() const {
+    if (!compilation_result_) return nullptr;
+    return cbegin() + shaderc_result_get_length(compilation_result_) /
+                          sizeof(OutputElementType);
+  }
+
+  const_iterator begin() const { return cbegin(); }
+  const_iterator end() const { return cend(); }
+
+  // Returns the number of warnings generated for this entry point.
+  size_t GetNumWarnings() const {
+    if (!compilation_result_) return 0;
+    return shaderc_result_get_num_warnings(compilation_result_);
+  }
+
+  // Returns the number of errors generated for this entry point.
+  size_t GetNumErrors() const {
+    if (!compilation_result_) return 0;
+    return shaderc_result_get_num_errors(compilation_result_);
+  }
+
+ private:
+  shaderc_compilation_result_t compilation_result_;
+  std::string entry_point_name_;
+  shaderc_shader_kind stage_;
+};
+
+// The result of compiling several entry points from one source in a single
+// request.  It keeps one entry point result per requested entry point, in
+// request order, so a failing entry point can be located by index while the
+// other entry points still produce their own modules.
+template <typename OutputElementType>
+class MultipleEntryPointsCompilationResult {
+ public:
+  typedef EntryPointCompilationResult<OutputElementType> EntryPointResult;
+
+  // Takes ownership of the result set.
+  explicit MultipleEntryPointsCompilationResult(
+      shaderc_compilation_result_set_t result_set)
+      : result_set_(result_set), num_results_(0) {
+    if (result_set_) {
+      num_results_ = shaderc_result_set_get_num_results(result_set_);
+    }
+  }
+  MultipleEntryPointsCompilationResult()
+      : result_set_(nullptr), num_results_(0) {}
+  ~MultipleEntryPointsCompilationResult() {
+    shaderc_result_set_release(result_set_);
+  }
+
+  MultipleEntryPointsCompilationResult(
+      MultipleEntryPointsCompilationResult&& other)
+      : result_set_(nullptr), num_results_(0) {
+    *this = std::move(other);
+  }
+
+  MultipleEntryPointsCompilationResult& operator=(
+      MultipleEntryPointsCompilationResult&& other) {
+    if (result_set_) shaderc_result_set_release(result_set_);
+    result_set_ = other.result_set_;
+    num_results_ = other.num_results_;
+    other.result_set_ = nullptr;
+    other.num_results_ = 0;
+    return *this;
+  }
+
+  // Returns the number of entry point results.
+  size_t GetNumResults() const { return num_results_; }
+
+  // Returns the result for the entry point at index.  If index is out of
+  // range, the returned view has no output and reports a null result object.
+  EntryPointResult GetResult(size_t index) const {
+    if (!result_set_ || index >= num_results_) {
+      return EntryPointResult(nullptr, "", shaderc_glsl_infer_from_source);
+    }
+    const char* name =
+        shaderc_result_set_get_entry_point_name(result_set_, index);
+    return EntryPointResult(
+        shaderc_result_set_get_result(result_set_, index), name ? name : "",
+        shaderc_result_set_get_entry_point_stage(result_set_, index));
+  }
+
+  // Returns the status of the whole request: success when every entry point
+  // compiled, otherwise the status of the first entry point that failed.
+  shaderc_compilation_status GetCompilationStatus() const {
+    if (!result_set_) return shaderc_compilation_status_null_result_object;
+    return shaderc_result_set_get_compilation_status(result_set_);
+  }
+
+ private:
+  MultipleEntryPointsCompilationResult(
+      const MultipleEntryPointsCompilationResult& other) = delete;
+  MultipleEntryPointsCompilationResult& operator=(
+      const MultipleEntryPointsCompilationResult& other) = delete;
+
+  shaderc_compilation_result_set_t result_set_;
+  size_t num_results_;
+};
+
+// Compiling several entry points at once yields a SPIR-V binary module per
+// entry point, or SPIR-V assembly text per entry point.
+using MultipleEntryPointsSpvCompilationResult =
+    MultipleEntryPointsCompilationResult<uint32_t>;
+using MultipleEntryPointsAssemblyCompilationResult =
+    MultipleEntryPointsCompilationResult<char>;
 
 // Contains any options that can have default values for a compilation.
 class CompileOptions {
@@ -505,6 +660,61 @@ class Compiler {
                                         const char* input_file_name) const {
     return CompileGlslToSpv(source_text.data(), source_text.size(), shader_kind,
                             input_file_name);
+  }
+
+  // Compiles the given entry points from one source, returning one SPIR-V
+  // binary module per entry point.  Each entry point is compiled as if it had
+  // been passed to CompileGlslToSpv on its own, so each module has the
+  // execution model and resource interface of that entry point alone.
+  // An entry point that cannot be compiled, including a name that the source
+  // does not define, gets its own failed result at the same index; the other
+  // entry points are still compiled and reported for the entry points that
+  // were requested.  The results are in the same order as entry_points.
+  MultipleEntryPointsSpvCompilationResult CompileMultipleEntryPointsToSpv(
+      const char* source_text, size_t source_text_size,
+      const char* input_file_name, const shaderc_entry_point* entry_points,
+      size_t num_entry_points, const CompileOptions& options) const {
+    return MultipleEntryPointsSpvCompilationResult(
+        shaderc_compile_into_spv_multiple_entry_points(
+            compiler_, source_text, source_text_size, input_file_name,
+            entry_points, num_entry_points, options.options_));
+  }
+
+  // Like the previous CompileMultipleEntryPointsToSpv method but the source is
+  // provided as a std::string.
+  MultipleEntryPointsSpvCompilationResult CompileMultipleEntryPointsToSpv(
+      const std::string& source_text, const char* input_file_name,
+      const shaderc_entry_point* entry_points, size_t num_entry_points,
+      const CompileOptions& options) const {
+    return CompileMultipleEntryPointsToSpv(
+        source_text.data(), source_text.size(), input_file_name, entry_points,
+        num_entry_points, options);
+  }
+
+  // Compiles the given entry points from one source, returning SPIR-V assembly
+  // text for each entry point.  Semantics are the same as
+  // CompileMultipleEntryPointsToSpv.
+  MultipleEntryPointsAssemblyCompilationResult
+  CompileMultipleEntryPointsToSpvAssembly(
+      const char* source_text, size_t source_text_size,
+      const char* input_file_name, const shaderc_entry_point* entry_points,
+      size_t num_entry_points, const CompileOptions& options) const {
+    return MultipleEntryPointsAssemblyCompilationResult(
+        shaderc_compile_into_spv_assembly_multiple_entry_points(
+            compiler_, source_text, source_text_size, input_file_name,
+            entry_points, num_entry_points, options.options_));
+  }
+
+  // Like the previous CompileMultipleEntryPointsToSpvAssembly method but the
+  // source is provided as a std::string.
+  MultipleEntryPointsAssemblyCompilationResult
+  CompileMultipleEntryPointsToSpvAssembly(
+      const std::string& source_text, const char* input_file_name,
+      const shaderc_entry_point* entry_points, size_t num_entry_points,
+      const CompileOptions& options) const {
+    return CompileMultipleEntryPointsToSpvAssembly(
+        source_text.data(), source_text.size(), input_file_name, entry_points,
+        num_entry_points, options);
   }
 
   // Assembles the given SPIR-V assembly and returns a SPIR-V binary module

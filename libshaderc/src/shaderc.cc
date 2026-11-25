@@ -609,26 +609,72 @@ shaderc_compiler_t shaderc_compiler_initialize() {
 void shaderc_compiler_release(shaderc_compiler_t compiler) { delete compiler; }
 
 namespace {
-shaderc_compilation_result_t CompileToSpecifiedOutputType(
+// Returns true when the shader kind names a concrete stage, i.e. it neither
+// infers the stage from the source nor falls back to a default stage.
+bool IsConcreteStage(shaderc_shader_kind kind) {
+  return GetForcedStage(kind) != EShLangCount;
+}
+
+// Returns a human-readable name for the given concrete shader stage, for use
+// in diagnostics.
+const char* ConcreteStageName(shaderc_shader_kind kind) {
+  switch (kind) {
+    case shaderc_vertex_shader:
+      return "vertex";
+    case shaderc_fragment_shader:
+      return "fragment";
+    case shaderc_compute_shader:
+      return "compute";
+    case shaderc_geometry_shader:
+      return "geometry";
+    case shaderc_tess_control_shader:
+      return "tessellation control";
+    case shaderc_tess_evaluation_shader:
+      return "tessellation evaluation";
+    case shaderc_raygen_shader:
+      return "ray generation";
+    case shaderc_intersection_shader:
+      return "intersection";
+    case shaderc_anyhit_shader:
+      return "any-hit";
+    case shaderc_closesthit_shader:
+      return "closest-hit";
+    case shaderc_miss_shader:
+      return "miss";
+    case shaderc_callable_shader:
+      return "callable";
+    case shaderc_task_shader:
+      return "task";
+    case shaderc_mesh_shader:
+      return "mesh";
+    default:
+      break;
+  }
+  return "unknown";
+}
+
+// Compiles one shader into result, which must not be null.  When
+// entry_point_found is not null it is set to whether the compiled shader
+// defined the requested entry point; a shader built from a source language
+// that ignores the entry point name always reports true.
+void CompileToSpecifiedOutputType(
     const shaderc_compiler_t compiler, const char* source_text,
     size_t source_text_size, shaderc_shader_kind shader_kind,
     const char* input_file_name, const char* entry_point_name,
     const shaderc_compile_options_t additional_options,
-    shaderc_util::Compiler::OutputType output_type) {
-  auto* result = new (std::nothrow) shaderc_compilation_result_vector;
-  if (!result) return nullptr;
-
+    shaderc_util::Compiler::OutputType output_type,
+    shaderc_compilation_result_vector* result, bool* entry_point_found) {
   if (!input_file_name) {
     result->messages = "Input file name string was null.";
     result->num_errors = 1;
     result->compilation_status = shaderc_compilation_status_compilation_error;
-    return result;
+    return;
   }
   result->compilation_status = shaderc_compilation_status_invalid_stage;
   bool compilation_succeeded = false;  // In case we exit early.
   std::vector<uint32_t> compilation_output_data;
   size_t compilation_output_data_size_in_bytes = 0u;
-  if (!compiler->initializer) return result;
+  if (!compiler->initializer) return;
   TRY_IF_EXCEPTIONS_ENABLED {
     std::stringstream errors;
     size_t total_warnings = 0;
@@ -638,6 +684,7 @@ shaderc_compilation_result_t CompileToSpecifiedOutputType(
     shaderc_util::string_piece source_string =
         shaderc_util::string_piece(source_text, source_text + source_text_size);
     StageDeducer stage_deducer(shader_kind);
+    bool found = true;
     if (additional_options) {
       InternalFileIncluder includer(additional_options->include_resolver,
                                     additional_options->include_result_releaser,
@@ -652,7 +699,7 @@ shaderc_compilation_result_t CompileToSpecifiedOutputType(
               // We need to make this a reference wrapper, so that std::function
               // won't make a copy for this callable object.
               std::ref(stage_deducer), includer, output_type, &errors,
-              &total_warnings, &total_errors);
+              &total_warnings, &total_errors, &found);
     } else {
       // Compile with default options.
       InternalFileIncluder includer;
@@ -661,8 +708,9 @@ shaderc_compilation_result_t CompileToSpecifiedOutputType(
           shaderc_util::Compiler().Compile(
               source_string, forced_stage, input_file_name_str,
               entry_point_name, std::ref(stage_deducer), includer, output_type,
-              &errors, &total_warnings, &total_errors);
+              &errors, &total_warnings, &total_errors, &found);
     }
+    if (entry_point_found) *entry_point_found = found;
 
     result->messages = errors.str();
     result->SetOutputData(std::move(compilation_output_data));
@@ -683,7 +731,106 @@ shaderc_compilation_result_t CompileToSpecifiedOutputType(
   CATCH_IF_EXCEPTIONS_ENABLED(...) {
     result->compilation_status = shaderc_compilation_status_internal_error;
   }
+}
+
+// Creates a result object that reports a failure with the given message.  It is
+// used for entry point requests that cannot even be attempted, such as a
+// request with a stage that does not name a concrete stage.
+std::unique_ptr<shaderc_compilation_result> MakeFailedCompilationResult(
+    const std::string& message,
+    shaderc_compilation_status status =
+        shaderc_compilation_status_compilation_error) {
+  std::unique_ptr<shaderc_compilation_result_vector> result(
+      new (std::nothrow) shaderc_compilation_result_vector);
+  if (!result) return nullptr;
+  result->messages = message;
+  result->num_errors = 1;
+  result->compilation_status = status;
   return result;
+}
+
+// Implements the shaderc_compile_into_*_multiple_entry_points() functions.
+// Every requested entry point gets its own result, at the same index, even when
+// the entry point cannot be compiled.
+shaderc_compilation_result_set_t CompileMultipleEntryPoints(
+    const shaderc_compiler_t compiler, const char* source_text,
+    size_t source_text_size, const char* input_file_name,
+    const shaderc_entry_point* entry_points, size_t num_entry_points,
+    const shaderc_compile_options_t additional_options,
+    shaderc_util::Compiler::OutputType output_type) {
+  std::unique_ptr<shaderc_compilation_result_set> result_set(
+      new (std::nothrow) shaderc_compilation_result_set);
+  if (!result_set) return nullptr;
+
+  TRY_IF_EXCEPTIONS_ENABLED {
+    result_set->entries.reserve(num_entry_points);
+    for (size_t i = 0; i < num_entry_points; ++i) {
+      shaderc_compilation_result_set::Entry entry;
+      if (!entry_points) {
+        entry.result = MakeFailedCompilationResult(
+            "Entry point request was null; no entry point to compile.\n");
+        result_set->entries.push_back(std::move(entry));
+        continue;
+      }
+      const char* name = entry_points[i].name;
+      entry.entry_point_name = name ? name : "";
+      entry.stage = entry_points[i].stage;
+
+      if (!IsConcreteStage(entry.stage)) {
+        std::ostringstream message;
+        message << "Entry point '" << entry.entry_point_name
+                << "': shader kind " << static_cast<int>(entry.stage)
+                << " does not name a concrete shader stage; "
+                   "specify a stage such as shaderc_vertex_shader or "
+                   "shaderc_fragment_shader.\n";
+        entry.result = MakeFailedCompilationResult(
+            message.str(), shaderc_compilation_status_invalid_stage);
+        result_set->entries.push_back(std::move(entry));
+        continue;
+      }
+
+      std::unique_ptr<shaderc_compilation_result_vector> result(
+          new (std::nothrow) shaderc_compilation_result_vector);
+      if (!result) {
+        // Leave a null result behind; the caller can still see the entry point.
+        result_set->entries.push_back(std::move(entry));
+        continue;
+      }
+
+      bool entry_point_found = true;
+      CompileToSpecifiedOutputType(
+          compiler, source_text, source_text_size, entry.stage, input_file_name,
+          entry.entry_point_name.c_str(), additional_options, output_type,
+          result.get(), &entry_point_found);
+
+      if (result->compilation_status == shaderc_compilation_status_success &&
+          !entry_point_found) {
+        // Glslang treats an HLSL entry point that does not exist as a warning
+        // and emits a module with an empty stub function.  That module would be
+        // handed to a pipeline for the wrong program, so fail this entry point
+        // instead.  The other entry points are unaffected.
+        std::ostringstream message;
+        message << "Entry point '" << entry.entry_point_name << "' for "
+                << ConcreteStageName(entry.stage)
+                << " stage was not found in the shader source.\n";
+        result->messages += message.str();
+        result->SetOutputData(std::vector<uint32_t>());
+        result->output_data_size = 0;
+        result->num_errors += 1;
+        result->compilation_status =
+            shaderc_compilation_status_compilation_error;
+      }
+
+      entry.result = std::move(result);
+      result_set->entries.push_back(std::move(entry));
+    }
+  }
+  CATCH_IF_EXCEPTIONS_ENABLED(...) {
+    // Do not hand back a partially built set: results would not line up with
+    // the request.  Report the allocation-style failure the API documents.
+    result_set.reset();
+  }
+  return result_set.release();
 }
 }  // anonymous namespace
 
@@ -692,10 +839,13 @@ shaderc_compilation_result_t shaderc_compile_into_spv(
     size_t source_text_size, shaderc_shader_kind shader_kind,
     const char* input_file_name, const char* entry_point_name,
     const shaderc_compile_options_t additional_options) {
-  return CompileToSpecifiedOutputType(
+  auto* result = new (std::nothrow) shaderc_compilation_result_vector;
+  if (!result) return nullptr;
+  CompileToSpecifiedOutputType(
       compiler, source_text, source_text_size, shader_kind, input_file_name,
       entry_point_name, additional_options,
-      shaderc_util::Compiler::OutputType::SpirvBinary);
+      shaderc_util::Compiler::OutputType::SpirvBinary, result, nullptr);
+  return result;
 }
 
 shaderc_compilation_result_t shaderc_compile_into_spv_assembly(
@@ -703,10 +853,13 @@ shaderc_compilation_result_t shaderc_compile_into_spv_assembly(
     size_t source_text_size, shaderc_shader_kind shader_kind,
     const char* input_file_name, const char* entry_point_name,
     const shaderc_compile_options_t additional_options) {
-  return CompileToSpecifiedOutputType(
+  auto* result = new (std::nothrow) shaderc_compilation_result_vector;
+  if (!result) return nullptr;
+  CompileToSpecifiedOutputType(
       compiler, source_text, source_text_size, shader_kind, input_file_name,
       entry_point_name, additional_options,
-      shaderc_util::Compiler::OutputType::SpirvAssemblyText);
+      shaderc_util::Compiler::OutputType::SpirvAssemblyText, result, nullptr);
+  return result;
 }
 
 shaderc_compilation_result_t shaderc_compile_into_preprocessed_text(
@@ -714,10 +867,76 @@ shaderc_compilation_result_t shaderc_compile_into_preprocessed_text(
     size_t source_text_size, shaderc_shader_kind shader_kind,
     const char* input_file_name, const char* entry_point_name,
     const shaderc_compile_options_t additional_options) {
-  return CompileToSpecifiedOutputType(
+  auto* result = new (std::nothrow) shaderc_compilation_result_vector;
+  if (!result) return nullptr;
+  CompileToSpecifiedOutputType(
       compiler, source_text, source_text_size, shader_kind, input_file_name,
       entry_point_name, additional_options,
-      shaderc_util::Compiler::OutputType::PreprocessedText);
+      shaderc_util::Compiler::OutputType::PreprocessedText, result, nullptr);
+  return result;
+}
+
+shaderc_compilation_result_set_t shaderc_compile_into_spv_multiple_entry_points(
+    const shaderc_compiler_t compiler, const char* source_text,
+    size_t source_text_size, const char* input_file_name,
+    const shaderc_entry_point* entry_points, size_t num_entry_points,
+    const shaderc_compile_options_t additional_options) {
+  return CompileMultipleEntryPoints(
+      compiler, source_text, source_text_size, input_file_name, entry_points,
+      num_entry_points, additional_options,
+      shaderc_util::Compiler::OutputType::SpirvBinary);
+}
+
+shaderc_compilation_result_set_t
+shaderc_compile_into_spv_assembly_multiple_entry_points(
+    const shaderc_compiler_t compiler, const char* source_text,
+    size_t source_text_size, const char* input_file_name,
+    const shaderc_entry_point* entry_points, size_t num_entry_points,
+    const shaderc_compile_options_t additional_options) {
+  return CompileMultipleEntryPoints(
+      compiler, source_text, source_text_size, input_file_name, entry_points,
+      num_entry_points, additional_options,
+      shaderc_util::Compiler::OutputType::SpirvAssemblyText);
+}
+
+void shaderc_result_set_release(shaderc_compilation_result_set_t result_set) {
+  delete result_set;
+}
+
+size_t shaderc_result_set_get_num_results(
+    const shaderc_compilation_result_set_t result_set) {
+  if (!result_set) return 0;
+  return result_set->entries.size();
+}
+
+shaderc_compilation_result_t shaderc_result_set_get_result(
+    const shaderc_compilation_result_set_t result_set, size_t index) {
+  if (!result_set || index >= result_set->entries.size()) return nullptr;
+  return result_set->entries[index].result.get();
+}
+
+const char* shaderc_result_set_get_entry_point_name(
+    const shaderc_compilation_result_set_t result_set, size_t index) {
+  if (!result_set || index >= result_set->entries.size()) return nullptr;
+  return result_set->entries[index].entry_point_name.c_str();
+}
+
+shaderc_shader_kind shaderc_result_set_get_entry_point_stage(
+    const shaderc_compilation_result_set_t result_set, size_t index) {
+  if (!result_set || index >= result_set->entries.size())
+    return shaderc_glsl_infer_from_source;
+  return result_set->entries[index].stage;
+}
+
+shaderc_compilation_status shaderc_result_set_get_compilation_status(
+    const shaderc_compilation_result_set_t result_set) {
+  if (!result_set) return shaderc_compilation_status_null_result_object;
+  for (const auto& entry : result_set->entries) {
+    if (!entry.result) return shaderc_compilation_status_internal_error;
+    if (entry.result->compilation_status != shaderc_compilation_status_success)
+      return entry.result->compilation_status;
+  }
+  return shaderc_compilation_status_success;
 }
 
 shaderc_compilation_result_t shaderc_assemble_into_spv(

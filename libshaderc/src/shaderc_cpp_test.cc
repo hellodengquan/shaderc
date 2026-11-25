@@ -1285,6 +1285,79 @@ TEST(
   EXPECT_THAT(std::string(assembly.begin(), assembly.end()),
               HasSubstr("OpEntryPoint Vertex %EntryPoint \"EntryPoint\""));
 }
+
+// One HLSL file with two entry points that reach different resources.
+const char kHlslTwoEntryPointsForCpp[] =
+    "Texture2D<float4> DiffuseTex : register(t1);\n"
+    "SamplerState LinearSampler : register(s2);\n"
+    "RWStructuredBuffer<float4> Positions : register(u3);\n"
+    "float4 VSMain(uint id : SV_VertexID) : SV_POSITION {\n"
+    "  return Positions[id];\n"
+    "}\n"
+    "float4 PSMain(float4 pos : SV_POSITION) : SV_Target {\n"
+    "  return DiffuseTex.Sample(LinearSampler, pos.xy);\n"
+    "}\n";
+
+// The C++ wrapper keeps the per-entry-point results in request order and
+// exposes the requested name and stage alongside each result.
+TEST(EntryPointSetTest, CppWrapperReportsEachEntryPoint) {
+  shaderc::Compiler compiler;
+  CompileOptions options;
+  options.SetSourceLanguage(shaderc_source_language_hlsl);
+  const shaderc_entry_point requested[] = {
+      {"VSMain", shaderc_vertex_shader},
+      {"PSMain", shaderc_fragment_shader},
+  };
+  std::string shader(kHlslTwoEntryPointsForCpp);
+  auto result = compiler.CompileMultipleEntryPointsToSpvAssembly(
+      shader, "shader", requested, 2, options);
+
+  ASSERT_EQ(2u, result.GetNumResults());
+  EXPECT_EQ(shaderc_compilation_status_success, result.GetCompilationStatus());
+
+  auto vs = result.GetResult(0);
+  EXPECT_EQ("VSMain", vs.GetEntryPointName());
+  EXPECT_EQ(shaderc_vertex_shader, vs.GetEntryPointStage());
+  EXPECT_EQ(shaderc_compilation_status_success, vs.GetCompilationStatus());
+  const std::string vs_assembly(vs.cbegin(), vs.cend());
+  EXPECT_THAT(vs_assembly, HasSubstr("OpEntryPoint Vertex %VSMain"));
+  EXPECT_THAT(vs_assembly, Not(HasSubstr("DiffuseTex")));
+
+  auto ps = result.GetResult(1);
+  EXPECT_EQ("PSMain", ps.GetEntryPointName());
+  EXPECT_EQ(shaderc_fragment_shader, ps.GetEntryPointStage());
+  const std::string ps_assembly(ps.cbegin(), ps.cend());
+  EXPECT_THAT(ps_assembly, HasSubstr("OpEntryPoint Fragment %PSMain"));
+  EXPECT_THAT(ps_assembly, HasSubstr("OpDecorate %DiffuseTex Binding 1"));
+  EXPECT_THAT(ps_assembly, Not(HasSubstr("Positions")));
+}
+
+// A failing entry point keeps its slot, so later entry points still report
+// their own module, and the whole request reports the failure.
+TEST(EntryPointSetTest, CppWrapperKeepsFailingEntryPointInPlace) {
+  shaderc::Compiler compiler;
+  CompileOptions options;
+  options.SetSourceLanguage(shaderc_source_language_hlsl);
+  const shaderc_entry_point requested[] = {
+      {"VSMain", shaderc_vertex_shader},
+      {"Absent", shaderc_fragment_shader},
+      {"PSMain", shaderc_fragment_shader},
+  };
+  std::string shader(kHlslTwoEntryPointsForCpp);
+  auto result = compiler.CompileMultipleEntryPointsToSpv(shader, "shader",
+                                                         requested, 3, options);
+
+  ASSERT_EQ(3u, result.GetNumResults());
+  EXPECT_EQ(shaderc_compilation_status_success,
+            result.GetResult(0).GetCompilationStatus());
+  EXPECT_EQ(shaderc_compilation_status_compilation_error,
+            result.GetResult(1).GetCompilationStatus());
+  EXPECT_THAT(result.GetResult(1).GetErrorMessage(), HasSubstr("Absent"));
+  EXPECT_EQ(shaderc_compilation_status_success,
+            result.GetResult(2).GetCompilationStatus());
+  EXPECT_EQ(shaderc_compilation_status_compilation_error,
+            result.GetCompilationStatus());
+}
 #endif
 
 // Returns a fragment shader accessing a texture with the given

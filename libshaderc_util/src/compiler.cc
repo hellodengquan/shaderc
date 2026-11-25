@@ -22,6 +22,12 @@
 #include <tuple>
 
 #include "SPIRV/GlslangToSpv.h"
+// TIntermediate exposes the entry point count, which is the only reliable way
+// to tell a shader that defines the requested entry point from one where
+// Glslang only warned and synthesized an empty entry point.  Shaderc pins
+// Glslang in DEPS and builds it from the in-tree sources, which provide this
+// header; it is not part of Glslang's installed public headers.
+#include "glslang/MachineIndependent/localintermediate.h"
 #include "libshaderc_util/format.h"
 #include "libshaderc_util/io_shaderc.h"
 #include "libshaderc_util/message.h"
@@ -172,8 +178,8 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
                                     const string_piece& error_tag)>&
         stage_callback,
     CountingIncluder& includer, OutputType output_type,
-    std::ostream* error_stream, size_t* total_warnings,
-    size_t* total_errors) const {
+    std::ostream* error_stream, size_t* total_warnings, size_t* total_errors,
+    bool* entry_point_found) const {
   // Compilation results to be returned:
   // Initialize the result tuple as a failed compilation. In error cases, we
   // should return result_tuple directly without setting its members.
@@ -357,6 +363,17 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
                                  suppress_warnings_, program.getInfoLog(),
                                  total_warnings, total_errors);
   if (!success) return result_tuple;
+
+  if (entry_point_found) {
+    // Glslang only treats a missing HLSL entry point as a warning, and still
+    // produces a module whose entry point function is an empty stub.  Report
+    // whether the requested entry point was actually defined so callers can
+    // reject that stub instead of passing it off as the requested program.
+    const glslang::TIntermediate* intermediate =
+        program.getIntermediate(used_shader_stage);
+    *entry_point_found =
+        intermediate != nullptr && intermediate->getNumEntryPoints() > 0;
+  }
 
   // 'spirv' is an alias for the compilation_output_data. This alias is added
   // to serve as an input for the call to DissassemblyBinary.
