@@ -1327,6 +1327,367 @@ TEST_F(CppInterface, LimitsTexelOffsetHigherMaximum) {
                                   shaderc_glsl_fragment_shader, options_));
 }
 
+// ---------------------------------------------------------------------------
+// Device budget / resource limit tests.
+//
+// A renderer offline-compiles one GLSL material against several hardware
+// budgets.  Every shaderc_limit feeds a glslang TBuiltInResource field and is
+// observable through two channels:
+//   1. the gl_Max* built-in upper bound visible (and usable) in source;
+//   2. a diagnostic when a shader's actual usage exceeds the budget.
+// The values below are distinctive and stage appropriate so that swapping
+// two limit fields or sharing state between copied options changes the
+// asserted result.
+// ---------------------------------------------------------------------------
+
+const char kLocalSizeTooLargeDiagnostic[] =
+    "'local_size' : too large; see gl_MaxComputeWorkGroupSize";
+
+// Returns a compute shader declaring the given per-axis local work-group
+// size.  Axes are independent arguments, so a test can exceed exactly one
+// budget axis while keeping the other two at distinct legal values.
+std::string ComputeShaderWithLocalSize(int x, int y, int z) {
+  std::ostringstream oss;
+  oss << "#version 450\n"
+         "layout(local_size_x="
+      << x << ", local_size_y=" << y << ", local_size_z=" << z
+      << ") in;\n"
+         "void main() {}\n";
+  return oss.str();
+}
+
+// Encodes the three components of gl_MaxComputeWorkGroupSize into one
+// scalar.  With per-axis budgets (7, 5, 3), constant folding leaves the
+// unique literal 700503 in SPIR-V assembly, exposing the exact budget
+// triple without parsing metadata.
+const char kComputeWorkGroupSizeBudgetProbe[] =
+    "#version 450\n"
+    "layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;\n"
+    "layout(set = 0, binding = 0) buffer BudgetBuffer {\n"
+    "  int encoded;\n"
+    "} budget;\n"
+    "void main() {\n"
+    "  budget.encoded = gl_MaxComputeWorkGroupSize.x * 100000\n"
+    "                 + gl_MaxComputeWorkGroupSize.y * 100\n"
+    "                 + gl_MaxComputeWorkGroupSize.z;\n"
+    "}\n";
+
+// The built-in budget constant is itself a legal constant expression for a
+// layout declaration: asking for exactly the built-in per-axis maximum is
+// allowed, asking for one more is diagnosed.
+const char kComputeLocalSizeEqualsBuiltinBudget[] =
+    "#version 450\n"
+    "layout(local_size_x = gl_MaxComputeWorkGroupSize.x,\n"
+    "       local_size_y = gl_MaxComputeWorkGroupSize.y,\n"
+    "       local_size_z = gl_MaxComputeWorkGroupSize.z) in;\n"
+    "void main() {}\n";
+
+const char kComputeLocalSizeExceedsBuiltinBudgetX[] =
+    "#version 450\n"
+    "layout(local_size_x = gl_MaxComputeWorkGroupSize.x + 1,\n"
+    "       local_size_y = 1, local_size_z = 1) in;\n"
+    "void main() {}\n";
+
+TEST_F(CppInterface,
+       ResourceLimitsComputeBuiltinReflectsDistinctPerAxisBudgets) {
+  constexpr int kBudgetX = 7;
+  constexpr int kBudgetY = 5;
+  constexpr int kBudgetZ = 3;
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_x, kBudgetX);
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_y, kBudgetY);
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_z, kBudgetZ);
+
+  const std::string assembly = AssemblyOutput(
+      kComputeWorkGroupSizeBudgetProbe, shaderc_glsl_compute_shader, options_);
+  // 7 * 100000 + 5 * 100 + 3.
+  EXPECT_THAT(assembly, HasSubstr("OpConstant %int 700503"));
+}
+
+TEST_F(CppInterface,
+       ResourceLimitsComputeBuiltinIsUsableAsLayoutUpperBound) {
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_x, 7);
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_y, 5);
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_z, 3);
+
+  EXPECT_TRUE(CompilationSuccess(kComputeLocalSizeEqualsBuiltinBudget,
+                                 shaderc_glsl_compute_shader, options_));
+
+  const std::string errors =
+      CompilationErrors(kComputeLocalSizeExceedsBuiltinBudgetX,
+                        shaderc_glsl_compute_shader, options_);
+  EXPECT_THAT(errors, HasSubstr(kLocalSizeTooLargeDiagnostic));
+}
+
+TEST_F(CppInterface,
+       ResourceLimitsComputeWorkGroupSizeAxesAreEnforcedIndependently) {
+  // Distinct values per axis make any X/Y/Z field permutation observable.
+  constexpr int kBudgetX = 7;
+  constexpr int kBudgetY = 5;
+  constexpr int kBudgetZ = 3;
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_x, kBudgetX);
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_y, kBudgetY);
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_z, kBudgetZ);
+
+  // Exact per-axis budget is the inclusive boundary and compiles.
+  EXPECT_TRUE(CompilationSuccess(
+      ComputeShaderWithLocalSize(kBudgetX, kBudgetY, kBudgetZ),
+      shaderc_glsl_compute_shader, options_));
+
+  struct OverBudgetCase {
+    const char* axis;
+    int x;
+    int y;
+    int z;
+  };
+  const OverBudgetCase over_budget_cases[] = {
+      {"x", kBudgetX + 1, kBudgetY, kBudgetZ},
+      {"y", kBudgetX, kBudgetY + 1, kBudgetZ},
+      {"z", kBudgetX, kBudgetY, kBudgetZ + 1},
+  };
+  for (const auto& test_case : over_budget_cases) {
+    SCOPED_TRACE(test_case.axis);
+    const std::string errors = CompilationErrors(
+        ComputeShaderWithLocalSize(test_case.x, test_case.y, test_case.z),
+        shaderc_glsl_compute_shader, options_);
+    EXPECT_THAT(errors, HasSubstr(kLocalSizeTooLargeDiagnostic));
+  }
+}
+
+TEST_F(CppInterface,
+       ResourceLimitsCopiedDeviceBudgetCanTightenWithoutChangingParent) {
+  // Original device budget, with distinct values for the three axes.
+  constexpr int kParentX = 8;
+  constexpr int kParentY = 2;
+  constexpr int kParentZ = 4;
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_x, kParentX);
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_y, kParentY);
+  options_.SetLimit(shaderc_limit_max_compute_work_group_size_z, kParentZ);
+
+  // The exact same GLSL material is reused for every configuration.
+  const std::string material =
+      ComputeShaderWithLocalSize(kParentX, kParentY, kParentZ);
+
+  // The parent configuration expresses the original device upper bound.
+  EXPECT_TRUE(CompilationSuccess(material, shaderc_glsl_compute_shader,
+                                 options_));
+
+  // Derived device configuration: a copy that tightens X only.
+  CompileOptions derived(options_);
+  derived.SetLimit(shaderc_limit_max_compute_work_group_size_x, 4);
+
+  // The derived budget accepts its own X boundary and keeps enforcing the Y
+  // budget inherited from the parent.
+  EXPECT_TRUE(CompilationSuccess(
+      ComputeShaderWithLocalSize(4, kParentY, kParentZ),
+      shaderc_glsl_compute_shader, derived));
+  EXPECT_THAT(
+      CompilationErrors(
+          ComputeShaderWithLocalSize(4, kParentY + 1, kParentZ),
+          shaderc_glsl_compute_shader, derived),
+      HasSubstr(kLocalSizeTooLargeDiagnostic));
+
+  // The original material now exceeds the tightened X budget and is
+  // diagnosed rather than merely failing for an unspecified reason.
+  EXPECT_THAT(
+      CompilationErrors(material, shaderc_glsl_compute_shader, derived),
+      HasSubstr(kLocalSizeTooLargeDiagnostic));
+
+  // Interleave back on the parent: the same material must still compile,
+  // proving that tightening the derived configuration did not mutate or
+  // share the parent's limit storage.
+  EXPECT_TRUE(CompilationSuccess(material, shaderc_glsl_compute_shader,
+                                 options_));
+
+  // The source-visible built-in budget still reports the original triple on
+  // the parent, (8, 2, 4) -> 800204, while the derived configuration reports
+  // the tightened plus inherited triple, (4, 2, 4) -> 400204.
+  EXPECT_THAT(
+      AssemblyOutput(kComputeWorkGroupSizeBudgetProbe,
+                     shaderc_glsl_compute_shader, options_),
+      HasSubstr("OpConstant %int 800204"));
+  EXPECT_THAT(
+      AssemblyOutput(kComputeWorkGroupSizeBudgetProbe,
+                     shaderc_glsl_compute_shader, derived),
+      HasSubstr("OpConstant %int 400204"));
+}
+
+// Stage-specific built-in budget probes.  Each entry sets one limit to a
+// distinctive value and expects the corresponding gl_Max* constant to reach
+// the shader unchanged.
+struct BuiltinLimitProbeCase {
+  const char* label;
+  shaderc_shader_kind stage;
+  shaderc_limit limit;
+  int budget;
+  const char* shader;
+};
+
+const char kVertexAttribBudgetShader[] =
+    "#version 450\n"
+    "layout(location = 0) in vec4 position;\n"
+    "layout(set = 0, binding = 0) buffer BudgetBuffer {\n"
+    "  int value;\n"
+    "} budget;\n"
+    "void main() {\n"
+    "  budget.value = gl_MaxVertexAttribs;\n"
+    "  gl_Position = position;\n"
+    "}\n";
+
+const char kTessControlPatchVerticesBudgetShader[] =
+    "#version 450\n"
+    "layout(vertices = 3) out;\n"
+    "layout(set = 0, binding = 0) buffer BudgetBuffer {\n"
+    "  int value;\n"
+    "} budget;\n"
+    "void main() {\n"
+    "  budget.value = gl_MaxPatchVertices;\n"
+    "  gl_out[gl_InvocationID].gl_Position = vec4(0.0);\n"
+    "}\n";
+
+const char kTessEvalGenLevelBudgetShader[] =
+    "#version 450\n"
+    "layout(triangles, equal_spacing) in;\n"
+    "layout(set = 0, binding = 0) buffer BudgetBuffer {\n"
+    "  int value;\n"
+    "} budget;\n"
+    "void main() { budget.value = gl_MaxTessGenLevel; }\n";
+
+const char kGeometryOutputVerticesBudgetShader[] =
+    "#version 450\n"
+    "layout(triangles) in;\n"
+    "layout(triangle_strip, max_vertices = 1) out;\n"
+    "layout(set = 0, binding = 0) buffer BudgetBuffer {\n"
+    "  int value;\n"
+    "} budget;\n"
+    "void main() { budget.value = gl_MaxGeometryOutputVertices; }\n";
+
+const char kFragmentDrawBuffersBudgetShader[] =
+    "#version 450\n"
+    "layout(location = 0) out int value;\n"
+    "void main() { value = gl_MaxDrawBuffers; }\n";
+
+TEST_F(CppInterface, ResourceLimitsEveryStageBuiltinReflectsConfiguredBudget) {
+  const BuiltinLimitProbeCase cases[] = {
+      {"vertex attributes", shaderc_glsl_vertex_shader,
+       shaderc_limit_max_vertex_attribs, 37, kVertexAttribBudgetShader},
+      {"tessellation control patch vertices", shaderc_glsl_tess_control_shader,
+       shaderc_limit_max_patch_vertices, 29,
+       kTessControlPatchVerticesBudgetShader},
+      {"tessellation evaluation gen level",
+       shaderc_glsl_tess_evaluation_shader, shaderc_limit_max_tess_gen_level,
+       41, kTessEvalGenLevelBudgetShader},
+      {"geometry output vertices", shaderc_glsl_geometry_shader,
+       shaderc_limit_max_geometry_output_vertices, 43,
+       kGeometryOutputVerticesBudgetShader},
+      {"fragment draw buffers", shaderc_glsl_fragment_shader,
+       shaderc_limit_max_draw_buffers, 13, kFragmentDrawBuffersBudgetShader},
+  };
+
+  for (const BuiltinLimitProbeCase& test_case : cases) {
+    SCOPED_TRACE(test_case.label);
+    CompileOptions stage_options;
+    stage_options.SetLimit(test_case.limit, test_case.budget);
+
+    const std::string assembly = AssemblyOutput(
+        test_case.shader, test_case.stage, stage_options);
+    EXPECT_THAT(
+        assembly,
+        HasSubstr(std::string("OpConstant %int ") +
+                  std::to_string(test_case.budget)));
+  }
+}
+
+// Returns a vertex shader whose gl_ClipDistance array has the given size.
+std::string VertexShaderWithClipDistanceArray(int size) {
+  std::ostringstream oss;
+  oss << "#version 450\n"
+         "out float gl_ClipDistance["
+      << size << "];\n"
+                 "void main() {\n"
+                 "  gl_ClipDistance["
+      << (size - 1)
+      << "] = 1.0;\n"
+         "  gl_Position = vec4(0.0);\n"
+         "}\n";
+  return oss.str();
+}
+
+// Returns a geometry shader declaring the given max_vertices output budget.
+std::string GeometryShaderWithMaxVertices(int max_vertices) {
+  std::ostringstream oss;
+  oss << "#version 450\n"
+         "layout(triangles) in;\n"
+         "layout(triangle_strip, max_vertices = "
+      << max_vertices
+      << ") out;\n"
+         "void main() { EmitVertex(); EndPrimitive(); }\n";
+  return oss.str();
+}
+
+// Returns a fragment shader writing |count| distinct color attachments.
+std::string FragmentShaderWithOutputs(int count) {
+  std::ostringstream oss;
+  oss << "#version 450\n";
+  for (int i = 0; i < count; ++i) {
+    oss << "layout(location = " << i << ") out vec4 color" << i << ";\n";
+  }
+  oss << "void main() {\n";
+  for (int i = 0; i < count; ++i) {
+    oss << "  color" << i << " = vec4(0.0);\n";
+  }
+  oss << "}\n";
+  return oss.str();
+}
+
+TEST_F(CppInterface, ResourceLimitsStageSpecificOverUseIsDiagnosed) {
+  // Vertex stage convention: the gl_ClipDistance array size is bounded by
+  // MaxClipDistances, and the diagnostic quotes the configured budget.
+  {
+    CompileOptions options;
+    options.SetLimit(shaderc_limit_max_clip_distances, 5);
+    EXPECT_TRUE(CompilationSuccess(
+        VertexShaderWithClipDistanceArray(5), shaderc_glsl_vertex_shader,
+        options));
+    const std::string errors = CompilationErrors(
+        VertexShaderWithClipDistanceArray(6), shaderc_glsl_vertex_shader,
+        options);
+    EXPECT_THAT(errors,
+                HasSubstr("must be less than or equal to "
+                          "gl_MaxClipDistances (5)"));
+  }
+
+  // Geometry stage convention: max_vertices must not exceed
+  // MaxGeometryOutputVertices (equality is accepted).
+  {
+    CompileOptions options;
+    options.SetLimit(shaderc_limit_max_geometry_output_vertices, 9);
+    EXPECT_TRUE(CompilationSuccess(GeometryShaderWithMaxVertices(9),
+                                   shaderc_glsl_geometry_shader, options));
+    const std::string errors = CompilationErrors(
+        GeometryShaderWithMaxVertices(10), shaderc_glsl_geometry_shader,
+        options);
+    EXPECT_THAT(
+        errors,
+        HasSubstr("'max_vertices' : too large, must be less than "
+                  "gl_MaxGeometryOutputVertices"));
+  }
+
+  // Fragment stage convention: one color output per draw buffer location.
+  {
+    CompileOptions tight;
+    tight.SetLimit(shaderc_limit_max_draw_buffers, 2);
+    const std::string errors = CompilationErrors(
+        FragmentShaderWithOutputs(3), shaderc_glsl_fragment_shader, tight);
+    EXPECT_THAT(errors,
+                HasSubstr("'location' : too large for fragment output"));
+
+    CompileOptions exact;
+    exact.SetLimit(shaderc_limit_max_draw_buffers, 3);
+    EXPECT_TRUE(CompilationSuccess(FragmentShaderWithOutputs(3),
+                                   shaderc_glsl_fragment_shader, exact));
+  }
+}
+
 TEST_F(CppInterface, UniformsWithoutBindingsFailCompilation) {
   CompileOptions options;
   const std::string errors = CompilationErrors(

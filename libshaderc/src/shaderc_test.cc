@@ -1691,6 +1691,69 @@ TEST_F(CompileStringTest, LimitsTexelOffsetHigherMaximum) {
                                   options_.get()));
 }
 
+// Returns a compute shader declaring the given per-axis local work-group
+// size.
+std::string ShaderWithComputeLocalSize(int x, int y, int z) {
+  std::ostringstream oss;
+  oss << "#version 450\n"
+         "layout(local_size_x="
+      << x << ", local_size_y=" << y << ", local_size_z=" << z
+      << ") in;\n"
+         "void main() {}\n";
+  return oss.str();
+}
+
+// A cloned (derived device) configuration has independent limit storage:
+// tightening a limit on the clone rejects the same material there, while the
+// original options still express the original device budget afterwards.
+TEST_F(CompileStringTest, LimitsCloneTighteningLeavesOriginalBudgetIntact) {
+  constexpr int kParentX = 8;
+  constexpr int kParentY = 2;
+  constexpr int kParentZ = 4;
+  shaderc_compile_options_set_limit(
+      options_.get(), shaderc_limit_max_compute_work_group_size_x, kParentX);
+  shaderc_compile_options_set_limit(
+      options_.get(), shaderc_limit_max_compute_work_group_size_y, kParentY);
+  shaderc_compile_options_set_limit(
+      options_.get(), shaderc_limit_max_compute_work_group_size_z, kParentZ);
+
+  // The exact same material is compiled with both configurations.
+  const std::string material =
+      ShaderWithComputeLocalSize(kParentX, kParentY, kParentZ);
+
+  // Original device budget accepts the material at its exact caps.
+  EXPECT_TRUE(CompilationSuccess(material, shaderc_glsl_compute_shader,
+                                 options_.get()));
+
+  compile_options_ptr derived(
+      shaderc_compile_options_clone(options_.get()));
+  ASSERT_NE(nullptr, derived.get());
+  shaderc_compile_options_set_limit(
+      derived.get(), shaderc_limit_max_compute_work_group_size_x, 4);
+
+  // The clone accepts its own new X boundary and still enforces the
+  // inherited Y budget.
+  EXPECT_TRUE(CompilationSuccess(ShaderWithComputeLocalSize(4, kParentY,
+                                                            kParentZ),
+                                 shaderc_glsl_compute_shader, derived.get()));
+  EXPECT_FALSE(CompilationSuccess(
+      ShaderWithComputeLocalSize(4, kParentY + 1, kParentZ),
+      shaderc_glsl_compute_shader, derived.get()));
+
+  // The original material exceeds the tightened X budget and the diagnostic
+  // names the compute work-group size limit.
+  const std::string errors =
+      CompilationErrors(material, shaderc_glsl_compute_shader, derived.get());
+  EXPECT_THAT(errors,
+              HasSubstr("'local_size' : too large; see "
+                        "gl_MaxComputeWorkGroupSize"));
+
+  // Re-running the same material on the original configuration after the
+  // failed derived compilation still succeeds with the original budget.
+  EXPECT_TRUE(CompilationSuccess(material, shaderc_glsl_compute_shader,
+                                 options_.get()));
+}
+
 TEST_F(CompileStringWithOptionsTest, UniformsWithoutBindingsFailCompilation) {
   const std::string errors =
       CompilationErrors(kShaderWithUniformsWithoutBindings,
