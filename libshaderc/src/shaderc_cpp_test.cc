@@ -16,8 +16,10 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "common_shaders_for_test.h"
 #include "shaderc/shaderc.hpp"
@@ -1536,6 +1538,315 @@ TEST_F(CppInterface, NanClampSurvivesCloning) {
   const std::string disassembly_text = AssemblyOutput(
       kGlslShaderWithClamp, shaderc_glsl_fragment_shader, cloned_options);
   EXPECT_THAT(disassembly_text, HasSubstr("OpExtInst %v4float %1 NClamp"));
+}
+
+// A material shader whose visible output is assembled from one branch chosen
+// by MAT_ALBEDO_MODE plus the MAT_BASE_TINT constant supplied by the material
+// base configuration. MODE 3 is rejected on purpose so that one derived
+// variant can fail while the others keep compiling.
+const char kMaterialShaderWithMacros[] = R"(#version 450
+layout(location = 0) out vec4 out_color;
+
+#ifndef MAT_BASE_TINT
+#error MAT_BASE_TINT must be defined by the material base configuration
+#endif
+
+#if MAT_ALBEDO_MODE == 3
+#error MAT_ALBEDO_MODE 3 has no albedo branch
+#endif
+
+void main() {
+#if MAT_ALBEDO_MODE == 1
+  out_color = vec4(MAT_BASE_TINT, 1.5, 0.125, 1.0);
+#elif MAT_ALBEDO_MODE == 2
+  out_color = vec4(2.25, MAT_BASE_TINT, 3.5, 1.0);
+#else
+  out_color = vec4(MAT_BASE_TINT, 0.75, 0.375, 1.0);
+#endif
+}
+)";
+
+// A second material with an independent macro namespace, so that the same
+// compiler can be checked for carrying no state from one material to the next.
+const char kNextMaterialShaderWithMacros[] = R"(#version 450
+layout(location = 0) out vec4 out_color;
+
+#ifdef MAT_BASE_TINT
+#error MAT_BASE_TINT leaked from the previous material configuration
+#endif
+
+#ifndef MAT_GLOSS_BASE
+#error MAT_GLOSS_BASE must be defined by the next material base configuration
+#endif
+
+#if MAT_GLOSS_MODE == 2
+#error MAT_GLOSS_MODE 2 has no gloss branch
+#endif
+
+void main() {
+#if MAT_GLOSS_MODE == 1
+  out_color = vec4(MAT_GLOSS_BASE, 0.4375, 0.9375, 1.0);
+#else
+  out_color = vec4(0.9375, MAT_GLOSS_BASE, 0.6875, 1.0);
+#endif
+}
+)";
+
+// Builds the material base configuration that every derived variant starts
+// from. MAT_ALBEDO_MODE is fixed here so that derived variants can override
+// only the branch selector.
+CompileOptions MaterialBaseConfiguration() {
+  CompileOptions options;
+  options.AddMacroDefinition("MAT_BASE_TINT", "0.625");
+  options.AddMacroDefinition("MAT_ALBEDO_MODE", "0");
+  return options;
+}
+
+// Builds the base configuration of the second material handled by the same
+// compiler.
+CompileOptions NextMaterialBaseConfiguration() {
+  CompileOptions options;
+  options.AddMacroDefinition("MAT_GLOSS_BASE", "0.3125");
+  options.AddMacroDefinition("MAT_GLOSS_MODE", "0");
+  return options;
+}
+
+// Derives a configuration from |base| by committing an extra macro on a copy.
+// Later edits to |base| must not reach the returned configuration.
+CompileOptions DeriveConfiguration(const CompileOptions& base,
+                                   const std::string& macro,
+                                   const std::string& value) {
+  CompileOptions derived(base);
+  derived.AddMacroDefinition(macro, value);
+  return derived;
+}
+
+// Preprocesses the material shader with |options| and fails the test if
+// preprocessing reports an error.
+std::string PreprocessMaterial(const shaderc::Compiler& compiler,
+                               const std::string& shader,
+                               const CompileOptions& options) {
+  const PreprocessedSourceCompilationResult result = compiler.PreprocessGlsl(
+      shader, shaderc_glsl_fragment_shader, "material", options);
+  EXPECT_TRUE(CompilationResultIsSuccess(result)) << result.GetErrorMessage();
+  if (!CompilationResultIsSuccess(result)) return std::string();
+  return CompilerOutputAsString(result);
+}
+
+// Compiles the material shader to SPIR-V with |options|, then disassembles the
+// binary so that the constants used by the rendered output can be inspected.
+std::string CompileMaterialToDisassembly(const shaderc::Compiler& compiler,
+                                         const std::string& shader,
+                                         const CompileOptions& options) {
+  const SpvCompilationResult result = compiler.CompileGlslToSpv(
+      shader, shaderc_glsl_fragment_shader, "material", options);
+  EXPECT_TRUE(CompilationResultIsSuccess(result)) << result.GetErrorMessage();
+  if (!CompilationResultIsSuccess(result)) return std::string();
+  const std::vector<uint32_t> binary(result.cbegin(), result.cend());
+  std::string disassembly;
+  EXPECT_TRUE(spvtools::SpirvTools(SPV_ENV_UNIVERSAL_1_0)
+                  .Disassemble(binary, &disassembly))
+      << "failed to disassemble the SPIR-V produced for the material variant";
+  return disassembly;
+}
+
+// A variant case for the material editor: the albedo mode committed on top of
+// the base configuration, the assignment the preprocessor must keep for it,
+// the assignments that must be preprocessed away, and the constants that the
+// rendered SPIR-V may and may not use.
+struct MaterialVariantCase {
+  const char* description;
+  const char* albedo_mode;
+  const char* expected_out_color;
+  std::vector<const char*> absent_out_colors;
+  const char* expected_composite;
+  std::vector<const char*> absent_constants;
+};
+
+class MaterialVariantConfigurations
+    : public testing::TestWithParam<MaterialVariantCase> {};
+
+TEST_P(MaterialVariantConfigurations,
+       PreprocessingAndRenderedConstantsTraceToConfiguration) {
+  const MaterialVariantCase& test_case = GetParam();
+  shaderc::Compiler compiler;
+  const CompileOptions base = MaterialBaseConfiguration();
+  const CompileOptions variant =
+      DeriveConfiguration(base, "MAT_ALBEDO_MODE", test_case.albedo_mode);
+
+  // The preprocessor keeps exactly the branch committed by this configuration.
+  const std::string preprocessed =
+      PreprocessMaterial(compiler, kMaterialShaderWithMacros, variant);
+  EXPECT_THAT(preprocessed, HasSubstr(test_case.expected_out_color))
+      << test_case.description;
+  for (const char* absent : test_case.absent_out_colors) {
+    EXPECT_THAT(preprocessed, Not(HasSubstr(absent)))
+        << test_case.description;
+  }
+
+  // The rendered SPIR-V uses the base tint from the base configuration
+  // together with the constants of this variant's own branch.
+  const std::string disassembly = CompileMaterialToDisassembly(
+      compiler, kMaterialShaderWithMacros, variant);
+  EXPECT_THAT(disassembly, HasSubstr(test_case.expected_composite))
+      << test_case.description;
+  for (const char* absent : test_case.absent_constants) {
+    EXPECT_THAT(disassembly, Not(HasSubstr(absent)))
+        << test_case.description;
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MaterialEditor, MaterialVariantConfigurations,
+    testing::Values(
+        MaterialVariantCase{
+            "base configuration, MAT_ALBEDO_MODE 0", "0",
+            "out_color = vec4(0.625, 0.75, 0.375, 1.0);",
+            {"out_color = vec4(0.625, 1.5, 0.125, 1.0);",
+             "out_color = vec4(2.25, 0.625, 3.5, 1.0);"},
+            "OpConstantComposite %v4float %float_0_625 %float_0_75 "
+            "%float_0_375 %float_1",
+            {"%float_1_5", "%float_0_125", "%float_2_25", "%float_3_5"}},
+        MaterialVariantCase{
+            "derived variant, MAT_ALBEDO_MODE 1", "1",
+            "out_color = vec4(0.625, 1.5, 0.125, 1.0);",
+            {"out_color = vec4(0.625, 0.75, 0.375, 1.0);",
+             "out_color = vec4(2.25, 0.625, 3.5, 1.0);"},
+            "OpConstantComposite %v4float %float_0_625 %float_1_5 "
+            "%float_0_125 %float_1",
+            {"%float_2_25", "%float_3_5", "%float_0_75", "%float_0_375"}},
+        MaterialVariantCase{
+            "derived variant, MAT_ALBEDO_MODE 2", "2",
+            "out_color = vec4(2.25, 0.625, 3.5, 1.0);",
+            {"out_color = vec4(0.625, 0.75, 0.375, 1.0);",
+             "out_color = vec4(0.625, 1.5, 0.125, 1.0);"},
+            "OpConstantComposite %v4float %float_2_25 %float_0_625 "
+            "%float_3_5 %float_1",
+            {"%float_1_5", "%float_0_125", "%float_0_75", "%float_0_375"}}));
+
+TEST_F(CppInterface, MaterialVariantConfigurationIsCommittedWhenDerived) {
+  CompileOptions base = MaterialBaseConfiguration();
+  // The derived configuration captures the base macros as they are right now.
+  const CompileOptions committed_variant =
+      DeriveConfiguration(base, "MAT_ALBEDO_MODE", "1");
+  const std::string committed_preprocessed =
+      PreprocessMaterial(compiler_, kMaterialShaderWithMacros,
+                         committed_variant);
+
+  // Edits to the base configuration afterwards must not reach the variant.
+  base.AddMacroDefinition("MAT_BASE_TINT", "0.1875");
+  base.AddMacroDefinition("MAT_ALBEDO_MODE", "2");
+  const std::string later_preprocessed = PreprocessMaterial(
+      compiler_, kMaterialShaderWithMacros, committed_variant);
+  EXPECT_EQ(committed_preprocessed, later_preprocessed);
+  EXPECT_THAT(later_preprocessed,
+              HasSubstr("out_color = vec4(0.625, 1.5, 0.125, 1.0);"));
+
+  // The edited base configuration instead renders its own tint and branch.
+  const std::string edited_base_preprocessed =
+      PreprocessMaterial(compiler_, kMaterialShaderWithMacros, base);
+  EXPECT_THAT(edited_base_preprocessed,
+              HasSubstr("out_color = vec4(2.25, 0.1875, 3.5, 1.0);"));
+
+  // The rendered SPIR-V follows the same split.
+  const std::string committed_disassembly = CompileMaterialToDisassembly(
+      compiler_, kMaterialShaderWithMacros, committed_variant);
+  EXPECT_THAT(committed_disassembly,
+              HasSubstr("OpConstantComposite %v4float %float_0_625 %float_1_5 "
+                        "%float_0_125 %float_1"));
+  const std::string edited_base_disassembly = CompileMaterialToDisassembly(
+      compiler_, kMaterialShaderWithMacros, base);
+  EXPECT_THAT(edited_base_disassembly,
+              HasSubstr("OpConstantComposite %v4float %float_2_25 "
+                        "%float_0_1875 %float_3_5 %float_1"));
+}
+
+TEST_F(CppInterface, MaterialVariantFailureLeavesOtherVariantsWithOwnMacros) {
+  const CompileOptions base = MaterialBaseConfiguration();
+  const CompileOptions albedo_one =
+      DeriveConfiguration(base, "MAT_ALBEDO_MODE", "1");
+  const CompileOptions unsupported =
+      DeriveConfiguration(base, "MAT_ALBEDO_MODE", "3");
+  const CompileOptions albedo_two =
+      DeriveConfiguration(base, "MAT_ALBEDO_MODE", "2");
+
+  // The first variant generates code from its own macros.
+  const std::string preprocessed_one =
+      PreprocessMaterial(compiler_, kMaterialShaderWithMacros, albedo_one);
+  EXPECT_THAT(preprocessed_one,
+              HasSubstr("out_color = vec4(0.625, 1.5, 0.125, 1.0);"));
+
+  // The unsupported variant fails on its own committed macros and emits no
+  // rendered module.
+  const SpvCompilationResult unsupported_result = compiler_.CompileGlslToSpv(
+      kMaterialShaderWithMacros, shaderc_glsl_fragment_shader, "material",
+      unsupported);
+  EXPECT_EQ(shaderc_compilation_status_compilation_error,
+            unsupported_result.GetCompilationStatus());
+  EXPECT_THAT(unsupported_result.GetErrorMessage(),
+              HasSubstr("MAT_ALBEDO_MODE 3 has no albedo branch"));
+  EXPECT_FALSE(IsValidSpv(unsupported_result));
+
+  // The other variants still generate code from their own macros after that
+  // failure, on the same compiler.
+  const std::string disassembly_two = CompileMaterialToDisassembly(
+      compiler_, kMaterialShaderWithMacros, albedo_two);
+  EXPECT_THAT(disassembly_two,
+              HasSubstr("OpConstantComposite %v4float %float_2_25 %float_0_625 "
+                        "%float_3_5 %float_1"));
+  EXPECT_THAT(disassembly_two, Not(HasSubstr("%float_1_5")));
+  EXPECT_THAT(disassembly_two, Not(HasSubstr("%float_0_125")));
+
+  const std::string preprocessed_base =
+      PreprocessMaterial(compiler_, kMaterialShaderWithMacros, base);
+  EXPECT_THAT(preprocessed_base,
+              HasSubstr("out_color = vec4(0.625, 0.75, 0.375, 1.0);"));
+
+  // Re-deriving variant 1 after the failed compile yields the same semantics.
+  EXPECT_EQ(
+      PreprocessMaterial(compiler_, kMaterialShaderWithMacros, albedo_one),
+      preprocessed_one);
+}
+
+TEST_F(CppInterface, MaterialEditorReusesCompilerForTheNextMaterial) {
+  const CompileOptions first_material_base = MaterialBaseConfiguration();
+  // A variant of the first material fails, but the compiler must remain usable.
+  const CompileOptions flawed_variant =
+      DeriveConfiguration(first_material_base, "MAT_ALBEDO_MODE", "3");
+  EXPECT_FALSE(CompilationResultIsSuccess(compiler_.CompileGlslToSpv(
+      kMaterialShaderWithMacros, shaderc_glsl_fragment_shader, "material",
+      flawed_variant)));
+
+  // The next material has its own base configuration and its own variants.
+  const CompileOptions next_base = NextMaterialBaseConfiguration();
+  EXPECT_THAT(PreprocessMaterial(compiler_, kNextMaterialShaderWithMacros,
+                                 next_base),
+              HasSubstr("out_color = vec4(0.9375, 0.3125, 0.6875, 1.0);"));
+
+  const CompileOptions gloss_one =
+      DeriveConfiguration(next_base, "MAT_GLOSS_MODE", "1");
+  EXPECT_THAT(PreprocessMaterial(compiler_, kNextMaterialShaderWithMacros,
+                                 gloss_one),
+              HasSubstr("out_color = vec4(0.3125, 0.4375, 0.9375, 1.0);"));
+
+  // The rendered SPIR-V of the next material contains only its own constants;
+  // none of the first material's macros survive into this compile.
+  const std::string next_disassembly = CompileMaterialToDisassembly(
+      compiler_, kNextMaterialShaderWithMacros, gloss_one);
+  EXPECT_THAT(next_disassembly,
+              HasSubstr("OpConstantComposite %v4float %float_0_3125 "
+                        "%float_0_4375 %float_0_9375 %float_1"));
+  EXPECT_THAT(next_disassembly, Not(HasSubstr("%float_0_625")));
+  EXPECT_THAT(next_disassembly, Not(HasSubstr("%float_1_5")));
+  EXPECT_THAT(next_disassembly, Not(HasSubstr("%float_0_6875")));
+
+  // The other variant of the next material also keeps its own branch.
+  const std::string next_base_disassembly = CompileMaterialToDisassembly(
+      compiler_, kNextMaterialShaderWithMacros, next_base);
+  EXPECT_THAT(next_base_disassembly,
+              HasSubstr("OpConstantComposite %v4float %float_0_9375 "
+                        "%float_0_3125 %float_0_6875 %float_1"));
+  EXPECT_THAT(next_base_disassembly, Not(HasSubstr("%float_0_4375")));
 }
 
 }  // anonymous namespace
