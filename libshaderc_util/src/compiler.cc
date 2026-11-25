@@ -238,10 +238,20 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
     std::tie(success, preprocessed_shader, glslang_errors) =
         PreprocessShader(error_tag, input_source_string, preamble, includer);
 
+    // When preprocessing is the final output there is no later parsing pass
+    // to re-emit diagnostics, so report warnings according to the user's
+    // settings.  This keeps diagnostics about which version/profile
+    // declaration governs (e.g. a forced version/profile overriding the
+    // in-source #version) consistent with a full compile, including whether
+    // warnings-as-errors prevents any output from being produced.  When
+    // preprocessing only serves to deduce the shader stage, suppress
+    // warnings here; the parsing pass below will re-emit them.
+    const bool suppress_warnings = output_type == OutputType::PreprocessedText
+                                       ? suppress_warnings_
+                                       : true;
     success &= PrintFilteredErrors(error_tag, error_stream, warnings_as_errors_,
-                                   /* suppress_warnings = */ true,
-                                   glslang_errors.c_str(), total_warnings,
-                                   total_errors);
+                                   suppress_warnings, glslang_errors.c_str(),
+                                   total_warnings, total_errors);
     if (!success) return result_tuple;
     // Because of the behavior change of the #line directive, the #line
     // directive introducing each file's content must use the syntax for the

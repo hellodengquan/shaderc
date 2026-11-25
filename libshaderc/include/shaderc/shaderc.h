@@ -336,7 +336,11 @@ SHADERC_EXPORT void shaderc_compile_options_set_optimization_level(
 // number is the same as would appear in the #version annotation in the source.
 // Version and profile specified here overrides the #version annotation in the
 // source. Use profile: 'shaderc_profile_none' for GLSL versions that do not
-// define profiles, e.g. versions below 150.
+// define profiles, e.g. versions below 150.  When the version/profile given
+// here differs from the #version annotation in the source, a warning naming
+// the governing declaration is emitted, including when only preprocessed text
+// is requested; if warnings are treated as errors, that warning becomes an
+// error and no output is produced.
 SHADERC_EXPORT void shaderc_compile_options_set_forced_version_profile(
     shaderc_compile_options_t options, int version, shaderc_profile profile);
 

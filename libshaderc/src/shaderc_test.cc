@@ -567,6 +567,52 @@ TEST_F(CompileStringWithOptionsTest, ForcedVersionProfileConflictingStd) {
                         "while in source code it is (310, es)\n"));
 }
 
+TEST_F(CompileStringWithOptionsTest,
+       ForcedVersionProfileConflictingStdPreprocessedText) {
+  // Forces the version and profile to 450core, which is in conflict with the
+  // #version in shader.  Requesting only preprocessed text must report which
+  // declaration governs, exactly like a full compile does.
+  shaderc_compile_options_set_forced_version_profile(options_.get(), 450,
+                                                     shaderc_profile_core);
+  const std::string kVertexShader =
+      std::string("#version 310 es\n") + kCoreVertShaderWithoutVersion;
+  ASSERT_NE(nullptr, compiler_.get_compiler_handle());
+  EXPECT_THAT(CompilationWarnings(kVertexShader, shaderc_glsl_vertex_shader,
+                                  options_.get(), OutputType::PreprocessedText),
+              HasSubstr("warning: (version, profile) forced to be (450, core), "
+                        "while in source code it is (310, es)\n"));
+}
+
+TEST_F(CompileStringWithOptionsTest,
+       ForcedVersionProfileConflictingStdPreprocessedTextWarningsAsErrors) {
+  // With warnings treated as errors, the conflict diagnostic becomes an
+  // error and no preprocessed text is produced, matching a full compile.
+  shaderc_compile_options_set_forced_version_profile(options_.get(), 450,
+                                                     shaderc_profile_core);
+  shaderc_compile_options_set_warnings_as_errors(options_.get());
+  const std::string kVertexShader =
+      std::string("#version 310 es\n") + kCoreVertShaderWithoutVersion;
+  ASSERT_NE(nullptr, compiler_.get_compiler_handle());
+  EXPECT_THAT(CompilationErrors(kVertexShader, shaderc_glsl_vertex_shader,
+                                options_.get(), OutputType::PreprocessedText),
+              HasSubstr("error: (version, profile) forced to be (450, core), "
+                        "while in source code it is (310, es)\n"));
+}
+
+TEST_F(CompileStringWithOptionsTest,
+       ForcedVersionProfileConflictingStdPreprocessedTextSuppressWarnings) {
+  // Suppressed warnings stay suppressed when only preprocessing.
+  shaderc_compile_options_set_forced_version_profile(options_.get(), 450,
+                                                     shaderc_profile_core);
+  shaderc_compile_options_set_suppress_warnings(options_.get());
+  const std::string kVertexShader =
+      std::string("#version 310 es\n") + kCoreVertShaderWithoutVersion;
+  ASSERT_NE(nullptr, compiler_.get_compiler_handle());
+  EXPECT_THAT(CompilationWarnings(kVertexShader, shaderc_glsl_vertex_shader,
+                                  options_.get(), OutputType::PreprocessedText),
+              Not(HasSubstr("forced to be")));
+}
+
 TEST_F(CompileStringWithOptionsTest, ForcedVersionProfileUnknownVersionStd) {
   // Forces the version and profile to 4242core, which is an unknown version.
   shaderc_compile_options_set_forced_version_profile(

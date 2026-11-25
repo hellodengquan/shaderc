@@ -462,12 +462,6 @@ class Compiler {
   std::pair<EShLanguage, std::string> GetShaderStageFromSourceCode(
       string_piece filename, const std::string& preprocessed_shader) const;
 
-  // Determines version and profile from command line, or the source code.
-  // Returns the decoded version and profile pair on success. Otherwise,
-  // returns (0, ENoProfile).
-  std::pair<int, EProfile> DeduceVersionProfile(
-      const std::string& preprocessed_shader);
-
   // Gets version and profile specification from the given preprocessedshader.
   // Returns the decoded version and profile pair on success. Otherwise,
   // returns (0, ENoProfile).

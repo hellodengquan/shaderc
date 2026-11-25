@@ -213,7 +213,10 @@ GLSL, e.g., `450`.
 * `-std=` overwrites `#version` directives in all input shaders, including those
   preceding the argument.
 * If a `-std=` argument specifies a different version from a `#version`
-  directive in an input file, `glslc` will issue a warning.
+  directive in an input file, `glslc` will issue a warning telling which
+  declaration governs.  The warning is issued in every output mode, including
+  preprocessing-only mode (`-E`), and as usual `-Werror` turns it into an
+  error, in which case no output is produced.
 * If multiple `-std=` arguments are specified on the command line, only the last
   one takes effect.
 

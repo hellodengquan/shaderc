@@ -214,8 +214,7 @@ class CompilerTest : public testing::Test {
     DummyCountingIncluder dummy_includer;
     std::tie(result, std::ignore, std::ignore) = compiler_.Compile(
         source, stage, "shader", "main", dummy_stage_callback_, dummy_includer,
-        Compiler::OutputType::SpirvBinary, &errors, &total_warnings,
-        &total_errors);
+        output_type, &errors, &total_warnings, &total_errors);
     errors_ = errors.str();
     return result;
   }
@@ -270,6 +269,75 @@ TEST_F(CompilerTest, SimpleVertexShaderCompilesSuccessfullyToAssembly) {
 TEST_F(CompilerTest, SimpleVertexShaderPreprocessesSuccessfully) {
   EXPECT_TRUE(SimpleCompilationSucceedsForOutputType(
       kVertexShader, EShLangVertex, Compiler::OutputType::PreprocessedText));
+}
+
+// A shader whose in-source #version declaration conflicts with a forced
+// version/profile.  Preprocessing-only output must report which declaration
+// governs, exactly like a full compile does.
+const char kConflictingVersionShader[] =
+    "#version 310 es\n"
+    "void main() {}";
+
+TEST_F(CompilerTest, ForcedVersionProfileConflictWarnsWhenPreprocessing) {
+  compiler_.SetForcedVersionProfile(450, ECoreProfile);
+  EXPECT_TRUE(SimpleCompilationSucceedsForOutputType(
+      kConflictingVersionShader, EShLangVertex,
+      Compiler::OutputType::PreprocessedText));
+  EXPECT_THAT(errors_,
+              HasSubstr("warning: (version, profile) forced to be (450, "
+                        "core), while in source code it is (310, es)"));
+}
+
+TEST_F(CompilerTest, ForcedVersionProfileConflictWarnsWhenCompiling) {
+  compiler_.SetForcedVersionProfile(450, ECoreProfile);
+  EXPECT_TRUE(SimpleCompilationSucceedsForOutputType(
+      kConflictingVersionShader, EShLangVertex,
+      Compiler::OutputType::SpirvBinary));
+  EXPECT_THAT(errors_,
+              HasSubstr("warning: (version, profile) forced to be (450, "
+                        "core), while in source code it is (310, es)"));
+}
+
+TEST_F(CompilerTest,
+       ForcedVersionProfileConflictWarningEmittedOnlyOnceWithStageDeduction) {
+  // Compilation preprocesses the source to deduce the stage and then parses
+  // it.  The conflict warning must be reported exactly once, by the parsing
+  // pass.
+  compiler_.SetForcedVersionProfile(450, ECoreProfile);
+  const std::string shader =
+      "#version 310 es\n#pragma shader_stage(vertex)\nvoid main() {}";
+  EXPECT_TRUE(SimpleCompilationSucceeds(shader, EShLangCount));
+  const std::string warning = "(version, profile) forced to be";
+  size_t count = 0;
+  for (size_t pos = errors_.find(warning); pos != std::string::npos;
+       pos = errors_.find(warning, pos + 1)) {
+    ++count;
+  }
+  EXPECT_EQ(1u, count) << errors_;
+}
+
+TEST_F(CompilerTest,
+       ForcedVersionProfileConflictWarningsAsErrorsBlocksPreprocessedOutput) {
+  // With warnings treated as errors, the conflict diagnostic becomes an
+  // error and no preprocessed text is produced, matching a full compile.
+  compiler_.SetForcedVersionProfile(450, ECoreProfile);
+  compiler_.SetWarningsAsErrors();
+  EXPECT_FALSE(SimpleCompilationSucceedsForOutputType(
+      kConflictingVersionShader, EShLangVertex,
+      Compiler::OutputType::PreprocessedText));
+  EXPECT_THAT(errors_,
+              HasSubstr("error: (version, profile) forced to be (450, "
+                        "core), while in source code it is (310, es)"));
+}
+
+TEST_F(CompilerTest,
+       ForcedVersionProfileConflictWarningSuppressibleWhenPreprocessing) {
+  compiler_.SetForcedVersionProfile(450, ECoreProfile);
+  compiler_.SetSuppressWarnings();
+  EXPECT_TRUE(SimpleCompilationSucceedsForOutputType(
+      kConflictingVersionShader, EShLangVertex,
+      Compiler::OutputType::PreprocessedText));
+  EXPECT_THAT(errors_, Eq(""));
 }
 
 TEST_F(CompilerTest, BadVertexShaderFailsCompilation) {

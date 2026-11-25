@@ -137,6 +137,52 @@ class TestConflictingVersionAndStd(expect.ValidObjectFileWithWarning):
 
 
 @inside_glslc_testsuite('OptionStd')
+class TestConflictingVersionAndStdPreprocessOnly(expect.WarningMessage):
+    """Tests that with -E the -std/#version conflict is reported like in a
+    full compile, so the user knows which declaration governs."""
+
+    # Wrong #version here on purpose.
+    shader = FileShader(
+        '#version 310 es\n' + core_frag_shader_without_version(), '.frag')
+    # -std overwrites the wrong #version.
+    glslc_args = ['-E', '-std=450core', shader]
+
+    expected_warning = [
+        shader, ': warning: (version, profile) forced to be (450, core), while '
+        'in source code it is (310, es)\n1 warning generated.\n']
+
+
+@inside_glslc_testsuite('OptionStd')
+class TestConflictingVersionAndStdPreprocessOnlyWerror(expect.ErrorMessage):
+    """Tests that with -E -Werror the conflict warning becomes an error and
+    no preprocessed output is produced, matching a full compile."""
+
+    # Wrong #version here on purpose.
+    shader = FileShader(
+        '#version 310 es\n' + core_frag_shader_without_version(), '.frag')
+    glslc_args = ['-E', '-std=450core', '-Werror', shader]
+
+    expected_error = [
+        shader, ': error: (version, profile) forced to be (450, core), while '
+        'in source code it is (310, es)\n1 error generated.\n']
+
+
+@inside_glslc_testsuite('OptionStd')
+class TestConflictingVersionAndStdPreprocessOnlySuppressed(
+        expect.ReturnCodeIsZero, expect.NoOutputOnStderr, expect.StdoutMatch):
+    """Tests that with -E -w the conflict warning stays suppressed."""
+
+    # Wrong #version here on purpose.
+    shader = FileShader(
+        '#version 310 es\n' + core_frag_shader_without_version(), '.frag')
+    glslc_args = ['-E', '-w', '-std=450core', shader]
+
+    expected_stdout = (
+        '#version 310 es\n'
+        'void main() { int temp = gl_SampleID; }\n')
+
+
+@inside_glslc_testsuite('OptionStd')
 class TestMultipleStd(expect.ValidObjectFile):
     """Tests that for multiple -std, the last one takes effect."""
 

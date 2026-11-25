@@ -216,14 +216,18 @@ class TestPoundLineWithForcedDifferentVersion(
     expect.ReturnCodeIsZero, expect.StdoutMatch, expect.StderrMatch):
     """Tests that #line directives follows the behavior for the version
     specified via command-line, even if there is a version specification
-    in the source code."""
+    in the source code.  The conflict between the forced version/profile
+    and the in-source #version is reported, like in a full compile."""
 
     environment = Directory('.', [
         File('a.vert', '#version 150\n#include "b.glsl"\n'),
         File('b.glsl', 'void main() {}\n')])
     glslc_args = ['-E', '-std=310es', 'a.vert']
 
-    expected_stderr = ''
+    expected_stderr = \
+"""a.vert: warning: (version, profile) forced to be (310, es), while in source code it is (150, none)
+1 warning generated.
+"""
     expected_stdout = \
 """#version 150
 #extension GL_GOOGLE_include_directive : enable
