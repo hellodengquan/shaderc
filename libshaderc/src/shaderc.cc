@@ -560,6 +560,50 @@ void shaderc_compile_options_set_auto_map_locations(
   options->compiler.SetAutoMapLocations(auto_map);
 }
 
+namespace {
+
+// Converts parallel arrays of resource layout entries into the form the
+// compiler takes.  Any element of the parallel arrays may be null except the
+// names array.
+std::vector<shaderc_util::Compiler::ResourceLayoutEntry> GetResourceLayout(
+    const char* const* names, const shaderc_uniform_kind* kinds,
+    const uint32_t* sets, const uint32_t* bindings, size_t num_entries) {
+  std::vector<shaderc_util::Compiler::ResourceLayoutEntry> entries;
+  entries.reserve(num_entries);
+  for (size_t i = 0; i < num_entries; ++i) {
+    shaderc_util::Compiler::ResourceLayoutEntry entry;
+    entry.name = names[i] ? names[i] : "";
+    entry.kind = GetUniformKind(kinds[i]);
+    entry.set = sets[i];
+    entry.binding = bindings[i];
+    entries.push_back(std::move(entry));
+  }
+  return entries;
+}
+
+}  // anonymous namespace
+
+void shaderc_compile_options_set_resource_layout(
+    shaderc_compile_options_t options, const char* const* names,
+    const shaderc_uniform_kind* kinds, const uint32_t* sets,
+    const uint32_t* bindings, size_t num_entries) {
+  // An empty layout clears any previously set layout.  Otherwise every array
+  // must be supplied.
+  if (num_entries != 0 && (!names || !kinds || !sets || !bindings)) return;
+  options->compiler.SetResourceLayout(
+      GetResourceLayout(names, kinds, sets, bindings, num_entries));
+}
+
+void shaderc_compile_options_set_resource_layout_for_stage(
+    shaderc_compile_options_t options, shaderc_shader_kind shader_kind,
+    const char* const* names, const shaderc_uniform_kind* kinds,
+    const uint32_t* sets, const uint32_t* bindings, size_t num_entries) {
+  if (num_entries != 0 && (!names || !kinds || !sets || !bindings)) return;
+  options->compiler.SetResourceLayoutForStage(
+      GetStage(shader_kind),
+      GetResourceLayout(names, kinds, sets, bindings, num_entries));
+}
+
 void shaderc_compile_options_set_hlsl_register_set_and_binding_for_stage(
     shaderc_compile_options_t options, shaderc_shader_kind shader_kind,
     const char* reg, const char* set, const char* binding) {

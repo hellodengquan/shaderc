@@ -22,6 +22,7 @@
 #include <tuple>
 
 #include "SPIRV/GlslangToSpv.h"
+#include "glslang/MachineIndependent/localintermediate.h"
 #include "libshaderc_util/format.h"
 #include "libshaderc_util/io_shaderc.h"
 #include "libshaderc_util/message.h"
@@ -30,6 +31,7 @@
 #include "libshaderc_util/spirv_tools_wrapper.h"
 #include "libshaderc_util/string_piece.h"
 #include "libshaderc_util/version_profile.h"
+#include "resource_layout.h"
 #include "spirv-tools/libspirv.hpp"
 
 namespace {
@@ -352,11 +354,72 @@ std::tuple<bool, std::vector<uint32_t>, size_t> Compiler::Compile(
 
   glslang::TProgram program;
   program.addShader(&shader);
-  success = program.link(EShMsgDefault) && program.mapIO();
+  success = program.link(EShMsgDefault);
+
+  // Apply a shared resource layout, if one was supplied for this stage.  A
+  // shared layout is an input to automatic binding: it only takes effect when
+  // automatic binding is enabled, and it only governs GLSL, since HLSL
+  // resources are mapped through their register names.  When no layout
+  // applies, keep the previous mapping rules untouched.
+  std::vector<resource_layout::Conflict> layout_conflicts;
+  const auto& stage_layout =
+      resource_layout_[static_cast<int>(used_shader_stage)];
+  const bool use_layout = auto_bind_uniforms_ &&
+                          source_language_ == SourceLanguage::GLSL &&
+                          !stage_layout.empty();
+  if (success && use_layout) {
+    if (auto* intermediate = program.getIntermediate(used_shader_stage)) {
+      // glslang gives each resource type its own binding namespace when
+      // targeting OpenGL SPIR-V, and shares one namespace per set otherwise.
+      const bool per_resource_type_namespaces =
+          intermediate->getSpv().openGl != 0 ||
+          intermediate->getBindingsPerResourceType();
+      std::unique_ptr<glslang::TIoMapResolver> delegate(
+          program.getGlslIoResolver(used_shader_stage));
+      if (delegate) {
+        auto resolver = std::make_unique<resource_layout::Resolver>(
+            std::move(delegate), stage_layout, bases,
+            per_resource_type_namespaces);
+        // Pass a null mapper so glslang uses the same default mapper and per
+        // stage mapping order that mapIO() uses when no layout is supplied.
+        // The only difference is the resolver, which is what applies the
+        // shared layout.
+        success = program.mapIO(resolver.get(), nullptr);
+        layout_conflicts = resolver->conflicts();
+      } else {
+        success = program.mapIO();
+      }
+    } else {
+      success = program.mapIO();
+    }
+  } else if (success) {
+    success = program.mapIO();
+  }
+
   success &= PrintFilteredErrors(error_tag, error_stream, warnings_as_errors_,
                                  suppress_warnings_, program.getInfoLog(),
                                  total_warnings, total_errors);
   if (!success) return result_tuple;
+
+  // Report any disagreement between the shader's explicit layout and the
+  // shared layout.  Each message names the resource and the shared layout
+  // entry that conflict.  A conflicting binding cannot be honoured, so the
+  // compilation fails rather than silently emitting an inconsistent module.
+  if (!layout_conflicts.empty()) {
+    for (const auto& conflict : layout_conflicts) {
+      std::string source_name = conflict.loc.getFilenameStr();
+      if (source_name.empty()) source_name = error_tag;
+      if (conflict.loc.line > 0) {
+        *error_stream << source_name << ":" << conflict.loc.line
+                      << ": error: " << conflict.message << "\n";
+      } else {
+        *error_stream << source_name << ": error: " << conflict.message
+                      << "\n";
+      }
+    }
+    *total_errors += layout_conflicts.size();
+    return result_tuple;
+  }
 
   // 'spirv' is an alias for the compilation_output_data. This alias is added
   // to serve as an input for the call to DissassemblyBinary.

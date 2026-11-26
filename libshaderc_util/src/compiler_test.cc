@@ -619,6 +619,241 @@ TEST_F(CompilerTest, AutoMapBindingsSetsBindings) {
   EXPECT_THAT(disassembly, HasSubstr("OpDecorate %my_ubo Binding 4"));
 }
 
+// A vertex shader and a fragment shader that share some resources but declare
+// them in different orders, and each declare one resource the other cannot
+// see.  Used to check that a shared resource layout gives the shared resources
+// the same set and binding in both stages.
+const char kSharedLayoutVertexShader[] =
+    R"(#version 450
+       layout(location = 0) out vec2 uv;
+       uniform texture2D albedo;
+       uniform sampler albedo_sampler;
+       uniform Transform { mat4 mvp; } transform;
+       void main() {
+         uv = vec2(0.0);
+         gl_Position = transform.mvp * vec4(0.0, 0.0, 0.0, 1.0);
+       })";
+
+const char kSharedLayoutFragmentShader[] =
+    R"(#version 450
+       layout(location = 0) in vec2 uv;
+       layout(location = 0) out vec4 color;
+       uniform sampler albedo_sampler;
+       uniform texture2D extra_noise;
+       uniform texture2D albedo;
+       void main() {
+         color = texture(sampler2D(albedo, albedo_sampler), uv) +
+                 texture(sampler2D(extra_noise, albedo_sampler), uv);
+       })";
+
+std::vector<Compiler::ResourceLayoutEntry> SharedLayoutEntries() {
+  return {
+      {"albedo", Compiler::UniformKind::Texture, 0, 3},
+      {"albedo_sampler", Compiler::UniformKind::Sampler, 0, 4},
+      {"transform", Compiler::UniformKind::Buffer, 0, 0},
+  };
+}
+
+TEST_F(CompilerTest, SharedResourceLayoutGivesSharedResourcesSameSlots) {
+  compiler_.SetAutoBindUniforms(true);
+  compiler_.SetResourceLayout(SharedLayoutEntries());
+
+  const auto vert_words =
+      SimpleCompilationBinary(kSharedLayoutVertexShader, EShLangVertex);
+  const auto vert = Disassemble(vert_words);
+  EXPECT_THAT(vert, HasSubstr("OpDecorate %albedo Binding 3")) << vert;
+  EXPECT_THAT(vert, HasSubstr("OpDecorate %albedo_sampler Binding 4")) << vert;
+  EXPECT_THAT(vert, HasSubstr("OpDecorate %transform Binding 0")) << vert;
+
+  const auto frag_words =
+      SimpleCompilationBinary(kSharedLayoutFragmentShader, EShLangFragment);
+  const auto frag = Disassemble(frag_words);
+  // The shared resources keep the layout's slots ...
+  EXPECT_THAT(frag, HasSubstr("OpDecorate %albedo Binding 3")) << frag;
+  EXPECT_THAT(frag, HasSubstr("OpDecorate %albedo_sampler Binding 4")) << frag;
+  // ... and the resource only the fragment shader sees takes a free slot that
+  // does not collide with any slot the layout reserves.
+  EXPECT_THAT(frag, HasSubstr("OpDecorate %extra_noise Binding 1")) << frag;
+}
+
+TEST_F(CompilerTest, SharedResourceLayoutSkipsSlotsReservedForOtherStages) {
+  // The layout reserves binding 0 for 'transform', a resource the fragment
+  // shader cannot see.  A fragment-only texture must not take binding 0 or any
+  // other slot the layout reserves.
+  compiler_.SetAutoBindUniforms(true);
+  compiler_.SetResourceLayout(SharedLayoutEntries());
+  const auto frag_words =
+      SimpleCompilationBinary(kSharedLayoutFragmentShader, EShLangFragment);
+  const auto frag = Disassemble(frag_words);
+  EXPECT_THAT(frag, Not(HasSubstr("OpDecorate %extra_noise Binding 0")))
+      << frag;
+  EXPECT_THAT(frag, Not(HasSubstr("OpDecorate %extra_noise Binding 3")))
+      << frag;
+  EXPECT_THAT(frag, Not(HasSubstr("OpDecorate %extra_noise Binding 4")))
+      << frag;
+}
+
+TEST_F(CompilerTest, SharedResourceLayoutSandwichResourceShiftsSharedSlots) {
+  // A resource only the vertex shader sees, declared *before* the shared
+  // resources, must not shift the shared resources' slots.  Independent
+  // sequential allocation would place the leading resource at a low number and
+  // push the shared resources down, disagreeing with the fragment shader.
+  const char kVertWithLeadingResource[] =
+      R"(#version 450
+         layout(location = 0) out vec2 uv;
+         uniform texture2D vertex_only_tex;
+         uniform sampler vertex_only_sampler;
+         uniform texture2D albedo;
+         uniform sampler albedo_sampler;
+         void main() {
+           uv = vec2(0.0);
+           vec2 t = texture(sampler2D(vertex_only_tex, vertex_only_sampler),
+                            uv).xy;
+           gl_Position = vec4(t, texture(sampler2D(albedo, albedo_sampler),
+                                         uv).xy);
+         })";
+  compiler_.SetAutoBindUniforms(true);
+  compiler_.SetResourceLayout(SharedLayoutEntries());
+  const auto vert_words =
+      SimpleCompilationBinary(kVertWithLeadingResource, EShLangVertex);
+  const auto vert = Disassemble(vert_words);
+  EXPECT_THAT(vert, HasSubstr("OpDecorate %albedo Binding 3")) << vert;
+  EXPECT_THAT(vert, HasSubstr("OpDecorate %albedo_sampler Binding 4")) << vert;
+}
+
+TEST_F(CompilerTest, SharedResourceLayoutDoesNotMatchDifferentKind) {
+  // The layout names 'albedo' as a texture.  A sampler named 'albedo' must not
+  // inherit the texture entry's slot.
+  const char kSamplerNamedLikeTexture[] =
+      R"(#version 450
+         layout(location = 0) out vec4 color;
+         uniform sampler albedo;
+         uniform texture2D tex;
+         void main() {
+           color = texture(sampler2D(tex, albedo), vec2(0.0));
+         })";
+  compiler_.SetAutoBindUniforms(true);
+  compiler_.SetResourceLayout(
+      {{"albedo", Compiler::UniformKind::Texture, 0, 7}});
+  const auto words =
+      SimpleCompilationBinary(kSamplerNamedLikeTexture, EShLangFragment);
+  const auto disassembly = Disassemble(words);
+  // The sampler is allocated as a sampler, not at the texture entry's slot 7.
+  EXPECT_THAT(disassembly, Not(HasSubstr("OpDecorate %albedo Binding 7")))
+      << disassembly;
+  EXPECT_THAT(disassembly, HasSubstr("OpDecorate %albedo Binding 0"))
+      << disassembly;
+}
+
+TEST_F(CompilerTest, SharedResourceLayoutHonoursAgreeingExplicitBinding) {
+  // An explicit binding that agrees with the layout is not a conflict, and the
+  // slot is reserved only once.
+  const char kExplicitAgrees[] =
+      R"(#version 450
+         layout(location = 0) out vec4 color;
+         layout(binding = 3) uniform texture2D albedo;
+         uniform sampler albedo_sampler;
+         void main() {
+           color = texture(sampler2D(albedo, albedo_sampler), vec2(0.0));
+         })";
+  compiler_.SetAutoBindUniforms(true);
+  compiler_.SetResourceLayout(
+      {{"albedo", Compiler::UniformKind::Texture, 0, 3},
+       {"albedo_sampler", Compiler::UniformKind::Sampler, 0, 4}});
+  EXPECT_TRUE(SimpleCompilationSucceeds(kExplicitAgrees, EShLangFragment))
+      << errors_;
+  const auto words = SimpleCompilationBinary(kExplicitAgrees, EShLangFragment);
+  const auto disassembly = Disassemble(words);
+  EXPECT_THAT(disassembly, HasSubstr("OpDecorate %albedo Binding 3"))
+      << disassembly;
+  EXPECT_THAT(disassembly, HasSubstr("OpDecorate %albedo_sampler Binding 4"))
+      << disassembly;
+}
+
+TEST_F(CompilerTest, SharedResourceLayoutReportsConflictWithExplicit) {
+  // The shader pins 'albedo' to binding 9, but the layout assigns it binding 3.
+  // Compilation fails, and the error names both sides.
+  const char kExplicitConflicts[] =
+      R"(#version 450
+         layout(location = 0) out vec4 color;
+         layout(binding = 9) uniform texture2D albedo;
+         uniform sampler albedo_sampler;
+         void main() {
+           color = texture(sampler2D(albedo, albedo_sampler), vec2(0.0));
+         })";
+  compiler_.SetAutoBindUniforms(true);
+  compiler_.SetResourceLayout(
+      {{"albedo", Compiler::UniformKind::Texture, 0, 3}});
+  EXPECT_FALSE(SimpleCompilationSucceeds(kExplicitConflicts, EShLangFragment));
+  EXPECT_THAT(errors_, HasSubstr("resource 'albedo'"));
+  EXPECT_THAT(errors_, HasSubstr("binding 9"));
+  EXPECT_THAT(errors_, HasSubstr("shared resource layout"));
+  EXPECT_THAT(errors_, HasSubstr("binding 3"));
+}
+
+TEST_F(CompilerTest, WithoutSharedResourceLayoutOldRulesApply) {
+  // With no shared layout, automatic binding keeps the per-stage sequential
+  // allocation: the fragment shader's resources take 0 and 1 in order.
+  compiler_.SetAutoBindUniforms(true);
+  const auto words =
+      SimpleCompilationBinary(kSharedLayoutFragmentShader, EShLangFragment);
+  const auto disassembly = Disassemble(words);
+  EXPECT_THAT(disassembly, HasSubstr("OpDecorate %albedo_sampler Binding 0"))
+      << disassembly;
+  EXPECT_THAT(disassembly, HasSubstr("OpDecorate %extra_noise Binding 1"))
+      << disassembly;
+  EXPECT_THAT(disassembly, HasSubstr("OpDecorate %albedo Binding 2"))
+      << disassembly;
+}
+
+TEST_F(CompilerTest, SharedResourceLayoutRequiresAutoBind) {
+  // A shared layout is an input to automatic binding.  Without automatic
+  // binding, a shader with unbound resources still fails to compile exactly as
+  // before, rather than being silently bound by the layout.
+  compiler_.SetAutoBindUniforms(false);
+  compiler_.SetResourceLayout(SharedLayoutEntries());
+  EXPECT_FALSE(
+      SimpleCompilationSucceeds(kSharedLayoutFragmentShader, EShLangFragment));
+  EXPECT_THAT(errors_,
+              HasSubstr("sampler/texture/image requires layout(binding=X)"));
+}
+
+TEST_F(CompilerTest, SharedResourceLayoutReservesSlotsAgainstRayTracing) {
+  // An acceleration structure is not described by a shared layout, and glslang
+  // does not classify it as a texture, yet in Vulkan it shares the descriptor
+  // namespace with textures.  An automatically bound acceleration structure
+  // must not land on a slot the layout reserves for another stage's resource.
+  const char kRayGenShader[] =
+      R"(#version 460
+         #extension GL_EXT_ray_tracing : enable
+         uniform accelerationStructureEXT tlas;
+         uniform texture2D albedo;
+         uniform sampler albedo_sampler;
+         layout(location = 0) rayPayloadEXT vec4 payload;
+         void main() {
+           payload = texture(sampler2D(albedo, albedo_sampler), vec2(0.0));
+           traceRayEXT(tlas, gl_RayFlagsOpaqueEXT, 0xff, 0, 0, 0, vec3(0.0),
+                       0.0, vec3(0.0, 0.0, 1.0), 1.0, 0);
+         })";
+  compiler_.SetTargetEnv(Compiler::TargetEnv::Vulkan,
+                         Compiler::TargetEnvVersion::Vulkan_1_2);
+  compiler_.SetAutoBindUniforms(true);
+  // Reserve binding 0, which no resource in this stage would otherwise use.
+  compiler_.SetResourceLayout(
+      {{"ghost", Compiler::UniformKind::Texture, 0, 0},
+       {"albedo", Compiler::UniformKind::Texture, 0, 2}});
+  const auto words = SimpleCompilationBinary(kRayGenShader, EShLangRayGen);
+  const auto disassembly = Disassemble(words);
+  EXPECT_THAT(disassembly, HasSubstr("OpDecorate %albedo Binding 2"))
+      << disassembly;
+  EXPECT_THAT(disassembly, Not(HasSubstr("OpDecorate %tlas Binding 0")))
+      << disassembly;
+  EXPECT_THAT(disassembly, HasSubstr("OpDecorate %tlas Binding 1"))
+      << disassembly;
+}
+
+
+
 TEST_F(CompilerTest, SetBindingBaseForTextureAdjustsTextureBindingsOnly) {
   compiler_.SetAutoBindUniforms(true);
   compiler_.SetAutoBindingBase(Compiler::UniformKind::Texture, 42);

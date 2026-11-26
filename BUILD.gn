@@ -40,6 +40,8 @@ source_set("shaderc_util_sources") {
     "libshaderc_util/src/file_finder.cc",
     "libshaderc_util/src/io_shaderc.cc",
     "libshaderc_util/src/message.cc",
+    "libshaderc_util/src/resource_layout.cc",
+    "libshaderc_util/src/resource_layout.h",
     "libshaderc_util/src/resources.cc",
     "libshaderc_util/src/shader_stage.cc",
     "libshaderc_util/src/spirv_tools_wrapper.cc",

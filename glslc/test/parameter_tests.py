@@ -94,6 +94,16 @@ Options:
   -fpreserve-bindings
                     Preserve all binding declarations, even if those bindings
                     are not used.
+  -fresource-layout [stage] <name> <kind> <set> <binding>
+                        [<name> <kind> <set> <binding>...]
+                    Use a shared resource layout for automatic bindings, so
+                    that independently compiled stages agree on the set and
+                    binding of the resources they share.  Each group of four
+                    arguments names a resource, its kind (texture, sampler,
+                    image, ubo, or ssbo), and the set and binding to use.
+                    Requires -fauto-bind-uniforms.  Optionally restrict it to
+                    a single stage.  A conflict between an explicit binding
+                    and the layout is reported as an error.
   -fresource-set-binding [stage] <reg0> <set0> <binding0>
                         [<reg1> <set1> <binding1>...]
                     Explicitly sets the descriptor set and binding for

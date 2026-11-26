@@ -2,6 +2,18 @@ Revision history for Shaderc
 
 v2026.5-dev 2026-09-11
  - Start development
+ - Add shared resource layouts for automatic binding.
+   A layout pins named resources to descriptor set and binding
+   numbers, so that independently compiled shader stages agree on
+   the set and binding of the resources they share, even when the
+   stages declare them in different orders or see different sets of
+   resources.  A conflict between a shader's explicit binding and
+   the layout is reported as an error naming both sides.
+     - libshaderc: shaderc_compile_options_set_resource_layout
+       and shaderc_compile_options_set_resource_layout_for_stage.
+     - C++ API: CompileOptions::SetResourceLayout and
+       CompileOptions::SetResourceLayoutForStage.
+     - glslc: -fresource-layout.
 
 v2026.4 2026-09-11
  - Use Glslang 16.6.0, SPIRV-Tools v2026.4.rc2

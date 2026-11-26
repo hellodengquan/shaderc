@@ -90,6 +90,16 @@ Options:
   -fpreserve-bindings
                     Preserve all binding declarations, even if those bindings
                     are not used.
+  -fresource-layout [stage] <name> <kind> <set> <binding>
+                        [<name> <kind> <set> <binding>...]
+                    Use a shared resource layout for automatic bindings, so
+                    that independently compiled stages agree on the set and
+                    binding of the resources they share.  Each group of four
+                    arguments names a resource, its kind (texture, sampler,
+                    image, ubo, or ssbo), and the set and binding to use.
+                    Requires -fauto-bind-uniforms.  Optionally restrict it to
+                    a single stage.  A conflict between an explicit binding
+                    and the layout is reported as an error.
   -fresource-set-binding [stage] <reg0> <set0> <binding0>
                         [<reg1> <set1> <binding1>...]
                     Explicitly sets the descriptor set and binding for
@@ -251,6 +261,28 @@ bool GetOptionalStageThenOffsetArgument(const shaderc_util::string_piece option,
   return true;
 }
 
+// Parses one resource layout kind name, such as "texture" or "ubo".  Returns
+// true on success and stores the kind in *kind.
+bool ParseResourceKind(const shaderc_util::string_piece name,
+                       shaderc_uniform_kind* kind) {
+  if (name == "texture") {
+    *kind = shaderc_uniform_kind_texture;
+  } else if (name == "sampler") {
+    *kind = shaderc_uniform_kind_sampler;
+  } else if (name == "image") {
+    *kind = shaderc_uniform_kind_image;
+  } else if (name == "ubo" || name == "buffer" || name == "cbuffer") {
+    *kind = shaderc_uniform_kind_buffer;
+  } else if (name == "ssbo" || name == "storage_buffer") {
+    *kind = shaderc_uniform_kind_storage_buffer;
+  } else if (name == "uav" || name == "unordered_access_view") {
+    *kind = shaderc_uniform_kind_unordered_access_view;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 }  // anonymous namespace
 
 int main(int argc, char** argv) {
@@ -371,6 +403,53 @@ int main(int argc, char** argv) {
                                               &arg_stage, &arg_base))
         return 1;
       set_binding_base(arg_stage, u_kind, arg_base);
+    } else if (arg == "-fresource-layout") {
+      // Each resource layout entry is a group of four arguments: name, kind,
+      // set, binding.  The option may be followed by an optional stage name.
+      if (i + 1 >= argc) {
+        std::cerr << "glslc: error: Option -fresource-layout requires at "
+                     "least one <name> <kind> <set> <binding> group"
+                  << std::endl;
+        return 1;
+      }
+      auto stage = glslc::MapStageNameToForcedKind(argv[i + 1]);
+      if (stage != shaderc_glsl_infer_from_source) {
+        ++i;
+      }
+      std::vector<shaderc::CompileOptions::ResourceLayoutEntry> entries;
+      while (i + 4 < argc && argv[i + 1][0] != '-' && argv[i + 2][0] != '-' &&
+             argv[i + 3][0] != '-' && argv[i + 4][0] != '-') {
+        shaderc::CompileOptions::ResourceLayoutEntry entry;
+        entry.name = argv[i + 1];
+        if (!ParseResourceKind(argv[i + 2], &entry.kind)) {
+          std::cerr << "glslc: error: unknown resource kind '" << argv[i + 2]
+                    << "' in -fresource-layout" << std::endl;
+          return 1;
+        }
+        if (!shaderc_util::ParseUint32(argv[i + 3], &entry.set)) {
+          std::cerr << "glslc: error: Invalid set number: " << argv[i + 3]
+                    << std::endl;
+          return 1;
+        }
+        if (!shaderc_util::ParseUint32(argv[i + 4], &entry.binding)) {
+          std::cerr << "glslc: error: Invalid binding number: " << argv[i + 4]
+                    << std::endl;
+          return 1;
+        }
+        entries.push_back(std::move(entry));
+        i += 4;
+      }
+      if (entries.empty()) {
+        std::cerr << "glslc: error: Option -fresource-layout requires at "
+                     "least one <name> <kind> <set> <binding> group"
+                  << std::endl;
+        return 1;
+      }
+      if (stage == shaderc_glsl_infer_from_source) {
+        compiler.options().SetResourceLayout(entries);
+      } else {
+        compiler.options().SetResourceLayoutForStage(stage, entries);
+      }
     } else if (arg == "-fresource-set-binding") {
       auto need_three_args_err = []() {
         std::cerr << "glsc: error: Option -fresource-set-binding"

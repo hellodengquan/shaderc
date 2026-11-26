@@ -23,6 +23,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "counting_includer.h"
 #include "file_finder.h"
@@ -137,6 +138,29 @@ class Compiler {
     UnorderedAccessView = 5,
   };
   enum { kNumUniformKinds = int(UniformKind::UnorderedAccessView) + 1 };
+
+  // One resource in a shared resource layout.
+  //
+  // A shared resource layout tells the automatically assigned bindings to use
+  // the same descriptor set and binding for a resource wherever it appears,
+  // even when vertex and fragment shaders are compiled independently and
+  // declare their resources in different orders (or see different numbers of
+  // resources).  Resources are identified by their declared name together with
+  // their kind, so the same name used for two different kinds of resource is
+  // not merged.
+  struct ResourceLayoutEntry {
+    // The name of the resource as declared in the shader.  For an interface
+    // block this is the block name (the type name), matching how glslang
+    // identifies uniform blocks.
+    std::string name;
+    // The kind of resource.  The entry only applies to resources of this kind.
+    UniformKind kind;
+    // The descriptor set to use.
+    uint32_t set;
+    // The binding number to use.  This is the final binding number, and is not
+    // offset by any automatic-binding base.
+    uint32_t binding;
+  };
 
   // Shader pipeline stage.
   // TODO(dneto): Replaces interface uses of EShLanguage with this enum.
@@ -315,6 +339,40 @@ class Compiler {
   void SetAutoBindingBaseForStage(Stage stage, UniformKind kind,
                                   uint32_t base) {
     auto_binding_base_[static_cast<int>(stage)][static_cast<int>(kind)] = base;
+  }
+
+  // Sets a shared resource layout: a set of entries that pin a named resource
+  // to a descriptor set and binding, for all shader stages.
+  //
+  // When automatic binding is enabled, a resource declared without an explicit
+  // `set` or `binding` gets the set and binding from the matching entry
+  // instead of using the per-stage sequential allocation.  Matching is by
+  // declared name and resource kind, so independently compiled stages agree on
+  // the same set and binding for resources they share, even when the stages
+  // declare them in different orders or see a different number of resources.
+  // Entries that do not match a resource in the shader being compiled are
+  // ignored, so a layout may describe resources only visible to other stages.
+  //
+  // A shader with an explicit `binding` or `set` layout for a resource is
+  // governed by the explicit layout; no shared entry is applied to it.  The
+  // compiler reports an error naming both the resource declaration and the
+  // shared entry when the two conflict, i.e. when the explicitly occupied slot
+  // collides with the slot the shared layout assigns to a different resource.
+  //
+  // Calls that never set a shared layout keep the previous allocation rules.
+  // The layout applies to every stage; use SetResourceLayoutForStage to
+  // restrict entries to a single stage.
+  void SetResourceLayout(std::vector<ResourceLayoutEntry> entries) {
+    for (auto stage : stages()) {
+      SetResourceLayoutForStage(stage, entries);
+    }
+  }
+
+  // Like SetResourceLayout, but the entries only apply when compiling the
+  // given shader stage.  Entries supplied for other stages are not consulted.
+  void SetResourceLayoutForStage(Stage stage,
+                                 std::vector<ResourceLayoutEntry> entries) {
+    resource_layout_[static_cast<int>(stage)] = std::move(entries);
   }
 
   // Sets whether the compiler should preserve all bindings, even when those
@@ -542,6 +600,10 @@ class Compiler {
   // automatically binding uniforms that don't hzve explicit bindings in the
   // shader source. The default is zero.
   uint32_t auto_binding_base_[kNumStages][kNumUniformKinds];
+
+  // Shared resource layout entries to apply, per stage.  Empty unless the
+  // caller supplied a layout with SetResourceLayout[ForStage].
+  std::vector<ResourceLayoutEntry> resource_layout_[kNumStages];
 
   // True if the compiler should automatically map uniforms that don't
   // have explicit locations.

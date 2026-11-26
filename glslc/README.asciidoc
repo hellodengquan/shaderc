@@ -560,6 +560,40 @@ a `binding` layout qualifier.  For example:
 layout(binding = 12) uniform texture2D;
 ----
 
+[[option-fresource-layout]]
+==== `-fresource-layout`
+
+Option `-fresource-layout [stage] <name> <kind> <set> <binding>
+[<name> <kind> <set> <binding>...]` supplies a shared resource layout for
+automatic binding.  Each group of four arguments names a resource, its kind,
+and the descriptor set and binding the resource must use.  The kind is one of
+`texture`, `sampler`, `image`, `ubo` (also `buffer` or `cbuffer`), or `ssbo`
+(also `storage_buffer`).  If a stage is
+specified, the layout only applies to that stage.
+
+The layout requires `-fauto-bind-uniforms`.  A resource declared without an
+explicit set or binding is matched by name and kind against the layout and
+given the layout's set and binding.  Resources a stage shares with another stage
+therefore get the same set and binding in both, even when the stages are
+compiled separately, declare the resources in different orders, or each see
+resources the other does not.  Entries that match nothing in a shader are
+ignored, so one layout can serve several stages.
+
+A shader's own `set` or `binding` layout takes precedence.  When it disagrees
+with a layout entry, compilation fails with an error that names both the
+resource and the conflicting slots.  For an interface block, the name may be
+either the block name or the instance name.
+
+Example:
+
+----
+glslc -fauto-bind-uniforms \
+      -fresource-layout albedo texture 0 3 \
+                        albedo_sampler sampler 0 4 \
+                        transform ubo 0 0 \
+      vert.glsl frag.glsl
+----
+
 [[option-fhlsl-iomap]]
 ==== `-fhlsl-iomap`
 

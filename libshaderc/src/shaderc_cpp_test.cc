@@ -1418,6 +1418,94 @@ TEST_F(CppInterface, SetBindingBaseSurvivesCloning) {
   EXPECT_THAT(disassembly_text, HasSubstr("OpDecorate %my_ubo Binding 70"));
 }
 
+TEST_F(CppInterface, SharedResourceLayoutGivesStagesSameSlots) {
+  // Two stages that share resources but declare them in different orders, each
+  // with one resource the other cannot see, must agree on the shared resources'
+  // set and binding when a shared resource layout names them.
+  const std::string vertex_shader =
+      R"(#version 450
+         layout(location = 0) out vec2 uv;
+         uniform texture2D albedo;
+         uniform sampler albedo_sampler;
+         uniform Shared { mat4 mvp; } shared_block;
+         void main() {
+           uv = vec2(0.0);
+           gl_Position = shared_block.mvp * vec4(0.0, 0.0, 0.0, 1.0);
+         })";
+  const std::string fragment_shader =
+      R"(#version 450
+         layout(location = 0) in vec2 uv;
+         layout(location = 0) out vec4 color;
+         uniform sampler albedo_sampler;
+         uniform texture2D fragment_only;
+         uniform texture2D albedo;
+         void main() {
+           color = texture(sampler2D(albedo, albedo_sampler), uv) +
+                   texture(sampler2D(fragment_only, albedo_sampler), uv);
+         })";
+
+  CompileOptions options;
+  options.SetAutoBindUniforms(true);
+  options.SetResourceLayout({
+      {"albedo", shaderc_uniform_kind_texture, 0, 3},
+      {"albedo_sampler", shaderc_uniform_kind_sampler, 0, 4},
+      {"shared_block", shaderc_uniform_kind_buffer, 0, 0},
+  });
+
+  const std::string vert = AssemblyOutput(vertex_shader,
+                                          shaderc_glsl_vertex_shader, options);
+  const std::string frag = AssemblyOutput(fragment_shader,
+                                          shaderc_glsl_fragment_shader, options);
+  EXPECT_THAT(vert, HasSubstr("OpDecorate %albedo Binding 3")) << vert;
+  EXPECT_THAT(vert, HasSubstr("OpDecorate %albedo_sampler Binding 4")) << vert;
+  EXPECT_THAT(vert, HasSubstr("OpDecorate %shared_block Binding 0")) << vert;
+  EXPECT_THAT(frag, HasSubstr("OpDecorate %albedo Binding 3")) << frag;
+  EXPECT_THAT(frag, HasSubstr("OpDecorate %albedo_sampler Binding 4")) << frag;
+  // The fragment-only resource avoids every slot the layout reserves.
+  EXPECT_THAT(frag, Not(HasSubstr("OpDecorate %fragment_only Binding 0")))
+      << frag;
+  EXPECT_THAT(frag, Not(HasSubstr("OpDecorate %fragment_only Binding 3")))
+      << frag;
+  EXPECT_THAT(frag, Not(HasSubstr("OpDecorate %fragment_only Binding 4")))
+      << frag;
+}
+
+TEST_F(CppInterface, SharedResourceLayoutReportsConflictWithExplicitBinding) {
+  const std::string shader =
+      R"(#version 450
+         layout(location = 0) out vec4 color;
+         layout(binding = 9) uniform texture2D albedo;
+         uniform sampler albedo_sampler;
+         void main() {
+           color = texture(sampler2D(albedo, albedo_sampler), vec2(0.0));
+         })";
+  CompileOptions options;
+  options.SetAutoBindUniforms(true);
+  options.SetResourceLayout(
+      {{"albedo", shaderc_uniform_kind_texture, 0, 3}});
+  const std::string errors = CompilationErrors(
+      shader, shaderc_glsl_fragment_shader, options);
+  EXPECT_THAT(errors, HasSubstr("resource 'albedo'"));
+  EXPECT_THAT(errors, HasSubstr("binding 9"));
+  EXPECT_THAT(errors, HasSubstr("binding 3"));
+}
+
+TEST_F(CppInterface, SharedResourceLayoutSurvivesCloning) {
+  const std::string shader =
+      R"(#version 450
+         layout(location = 0) out vec4 color;
+         uniform sampler2D albedo;
+         void main() { color = texture(albedo, vec2(0.0)); })";
+  CompileOptions options;
+  options.SetAutoBindUniforms(true);
+  options.SetResourceLayout(
+      {{"albedo", shaderc_uniform_kind_texture, 0, 5}});
+  CompileOptions cloned_options(options);
+  const std::string disassembly_text =
+      AssemblyOutput(shader, shaderc_glsl_fragment_shader, cloned_options);
+  EXPECT_THAT(disassembly_text, HasSubstr("OpDecorate %albedo Binding 5"));
+}
+
 TEST_F(CppInterface, GlslDefaultPackingUsed) {
   CompileOptions options;
   const std::string disassembly_text = AssemblyOutput(

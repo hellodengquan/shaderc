@@ -337,6 +337,75 @@ class CompileOptions {
     shaderc_compile_options_set_auto_map_locations(options_, auto_map);
   }
 
+  // One entry in a shared resource layout.  See SetResourceLayout.
+  struct ResourceLayoutEntry {
+    // The name of the resource as declared in the shader.  For an interface
+    // block this may be the block name or the instance name.
+    std::string name;
+    // The kind of resource the entry describes.
+    shaderc_uniform_kind kind;
+    // The descriptor set the resource must use.
+    uint32_t set;
+    // The binding the resource must use.
+    uint32_t binding;
+  };
+
+  // Sets a shared resource layout, applying it to all shader stages.
+  //
+  // When automatic binding is enabled, a resource declared without an explicit
+  // set or binding is matched by name and kind against the layout and uses the
+  // layout's set and binding.  Every stage reserves every layout slot, so
+  // independently compiled stages agree on the set and binding of the
+  // resources they share, even if they declare them in different orders or each
+  // sees resources the other does not.  A shader's own explicit set or binding
+  // takes precedence, and compilation fails with an error naming both sides if
+  // it disagrees with the layout.  Entries that match nothing are ignored.
+  //
+  // Calls that never set a resource layout keep the previous allocation rules.
+  void SetResourceLayout(const std::vector<ResourceLayoutEntry>& entries) {
+    std::vector<const char*> names;
+    std::vector<shaderc_uniform_kind> kinds;
+    std::vector<uint32_t> sets;
+    std::vector<uint32_t> bindings;
+    names.reserve(entries.size());
+    kinds.reserve(entries.size());
+    sets.reserve(entries.size());
+    bindings.reserve(entries.size());
+    for (const auto& entry : entries) {
+      names.push_back(entry.name.c_str());
+      kinds.push_back(entry.kind);
+      sets.push_back(entry.set);
+      bindings.push_back(entry.binding);
+    }
+    shaderc_compile_options_set_resource_layout(
+        options_, names.data(), kinds.data(), sets.data(), bindings.data(),
+        entries.size());
+  }
+
+  // Like SetResourceLayout, but the layout only applies when compiling the
+  // given shader stage.
+  void SetResourceLayoutForStage(
+      shaderc_shader_kind shader_kind,
+      const std::vector<ResourceLayoutEntry>& entries) {
+    std::vector<const char*> names;
+    std::vector<shaderc_uniform_kind> kinds;
+    std::vector<uint32_t> sets;
+    std::vector<uint32_t> bindings;
+    names.reserve(entries.size());
+    kinds.reserve(entries.size());
+    sets.reserve(entries.size());
+    bindings.reserve(entries.size());
+    for (const auto& entry : entries) {
+      names.push_back(entry.name.c_str());
+      kinds.push_back(entry.kind);
+      sets.push_back(entry.set);
+      bindings.push_back(entry.binding);
+    }
+    shaderc_compile_options_set_resource_layout_for_stage(
+        options_, shader_kind, names.data(), kinds.data(), sets.data(),
+        bindings.data(), entries.size());
+  }
+
   // Sets a descriptor set and binding for an HLSL register in the given stage.
   // Copies the parameter strings.
   void SetHlslRegisterSetAndBindingForStage(shaderc_shader_kind shader_kind,

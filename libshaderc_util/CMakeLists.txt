@@ -31,6 +31,8 @@ add_library(shaderc_util STATIC
   src/file_finder.cc
   src/io_shaderc.cc
   src/message.cc
+  src/resource_layout.cc
+  src/resource_layout.h
   src/resources.cc
   src/shader_stage.cc
   src/spirv_tools_wrapper.cc

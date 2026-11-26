@@ -477,6 +477,41 @@ SHADERC_EXPORT void shaderc_compile_options_set_max_id_bound(
 SHADERC_EXPORT void shaderc_compile_options_set_auto_map_locations(
     shaderc_compile_options_t options, bool auto_map);
 
+// Sets a shared resource layout: a set of entries that pin a named resource to
+// a descriptor set and binding across all shader stages.  This is the C
+// equivalent of shaderc::CompileOptions::SetResourceLayout.
+//
+// Each entry names a resource, by its declared name and its uniform kind, and
+// gives the descriptor set and binding the resource must use.  For an interface
+// block, the name may be the block name or the instance name.
+//
+// The layout only affects automatic binding, so it takes effect for a stage
+// only when automatic binding is enabled for that stage.  A resource that the
+// shader declares without an explicit set or binding is matched by name and
+// kind against the layout and uses the layout's set and binding.  Because every
+// stage reserves every layout slot, resources a stage shares with another stage
+// get the same set and binding in both, even when the stages declare them in
+// different orders or each sees resources the other does not.
+//
+// A shader that assigns its own set or binding for a matched resource keeps its
+// explicit layout.  When the explicit layout disagrees with the layout entry,
+// compilation fails with an error naming both the resource and the entry.
+// Entries that match nothing in a shader are ignored, so one layout can serve
+// several stages.
+//
+// Calls that never set a resource layout keep the previous allocation rules.
+SHADERC_EXPORT void shaderc_compile_options_set_resource_layout(
+    shaderc_compile_options_t options, const char* const* names,
+    const shaderc_uniform_kind* kinds, const uint32_t* sets,
+    const uint32_t* bindings, size_t num_entries);
+
+// Like shaderc_compile_options_set_resource_layout, but the entries only apply
+// when compiling the given shader stage.
+SHADERC_EXPORT void shaderc_compile_options_set_resource_layout_for_stage(
+    shaderc_compile_options_t options, shaderc_shader_kind shader_kind,
+    const char* const* names, const shaderc_uniform_kind* kinds,
+    const uint32_t* sets, const uint32_t* bindings, size_t num_entries);
+
 // Sets a descriptor set and binding for an HLSL register in the given stage.
 // This method keeps a copy of the string data.
 SHADERC_EXPORT void
